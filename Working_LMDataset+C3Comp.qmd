@@ -1,0 +1,741 @@
+---
+title: "Indicator Functions and Regression"
+format: html
+editor: visual
+---
+
+```{r packages, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(dplyr)
+library(arsenal)
+library(kableExtra)
+library(nlme)
+library(emmeans)
+library(splines)
+library(clubSandwich)
+library(table1)
+library(ggplot2)
+library(patchwork)
+library(viridis)
+
+
+formatp <- function(x) case_when(
+  x < 0.001 ~ "p<0.001",
+  x > 0.01 ~ Hmisc::format.pval(x, digits=2, eps=0.01, nsmall=2),
+  TRUE ~ Hmisc::format.pval(x, digits=3, eps=0.001, nsmall=3))
+```
+
+## Read data
+
+```{r}
+#| message: false
+
+
+# Participant characteristics data:
+SUBJINFO_raw <- read_csv("data/SUBJINFO.csv")
+
+# Longitudinal PACC data from Analysis Data Questionnaire Scores (ADQS):
+ADQS_raw <- read_csv("data/ADQS.csv")
+
+COGSTATE <- read_csv("data/COGSTATE_COMPUTERIZED.csv")
+```
+```{r}
+#| message: false
+
+PTAU217 <- read_csv("data/biomarker_pTau217.csv")
+```
+
+```{r data-manipulation}
+#| include: false
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "001") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "006") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw %>%
+  left_join(V6OUTCOME, by = "BID") %>%
+  left_join(V1OUTCOME %>%
+      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") %>%
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+
+# Filter ADQS_raw for PACC collected in the blinded phases among mITT population
+ADQS_PACC <- ADQS_raw %>%
+  filter(MITTFL== 1) %>%
+  filter(EPOCH == "BLINDED TREATMENT" | AVISIT == "006") %>%
+  filter(QSTESTCD == "PACC") %>%
+  rename(PACC = QSSTRESN) %>%
+  select(BID, ASEQNCS, TX, ADURW, TX, AGEYR, 
+    AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) %>%
+  mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) %>%
+  na.omit()
+```
+
+
+# Combining Data Sets
+
+## NO Reps??
+
+```{r extract-variables}
+#| message: false
+
+# Extract cognitive/functional variables from ADQS
+# Get both Visit 1 (baseline) and Visit 6 (endpoint) data
+ADQS_cognitive <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(
+    names_from = c(QSTESTCD, VISITCD),
+    values_from = QSSTRESN,
+    names_sep = "_V"
+  ) %>%
+  # Rename columns for clarity
+  rename_with(~ str_replace(.x, "_V001", "_V1"), everything()) %>%
+  rename_with(~ str_replace(.x, "_V006", "_V6"), everything())
+
+# Check what columns were created
+cat("ADQS_cognitive columns created:\n")
+print(names(ADQS_cognitive))
+
+# Extract C3Comp from COGSTATE
+# Filter for relevant visits if needed
+COGSTATE_data <- COGSTATE %>%
+  filter(AVISIT %in% c(1, 6)) %>%
+  filter(TESTCD == "C3Comp") %>%
+  select(BID, AVISIT, VALUE) %>%
+  pivot_wider(
+    names_from = AVISIT,
+    values_from = VALUE,
+    names_prefix = "C3Comp"
+  )
+
+# Check what columns were created
+cat("COGSTATE_data columns created:\n")
+print(names(COGSTATE_data))
+
+# Extract ORRES from PTAU217
+# Assuming this might be visit-specific as well
+PTAU_data <- PTAU217 %>%
+  select(BID, ORRES) %>%
+  # If there are multiple records per BID, you might need to filter by visit
+  # or take the first/last value - adjust as needed
+  distinct(BID, .keep_all = TRUE)
+
+# Combine all datasets
+combined_dataset <- SUBJINFO %>%
+  left_join(ADQS_cognitive, by = "BID") %>%
+  left_join(COGSTATE_data, by = "BID") %>%
+  left_join(PTAU_data, by = "BID") %>%
+  # Remove duplicate baseline variables that already exist in SUBJINFO
+  select(-any_of(c("CFISP", "CFIPT", "ADLPQSP", "ADLPQPT")))
+
+# Display the structure of the combined dataset
+cat("Combined dataset structure:\n")
+str(combined_dataset)
+
+# Show all column names related to cognitive tests
+cat("\nAll cognitive test columns in combined dataset:\n")
+print(names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))])
+
+# Show summary of key variables
+cognitive_cols <- names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))]
+cat("\nSummary of cognitive test variables:\n")
+
+summary(combined_dataset %>% 
+        select(all_of(cognitive_cols)))
+```
+
+```{r alternative-long-format}
+#| message: false
+# Alternative: Create a long format dataset for longitudinal analysis
+combined_long <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(names_from = QSTESTCD, values_from = QSSTRESN) %>%
+  # Add COGSTATE data
+  left_join(
+    COGSTATE %>%
+      filter(AVISIT %in% c(1, 6)) %>%
+      filter(TESTCD == "C3Comp") %>%
+      select(BID, AVISIT, VALUE, TESTCD) %>%
+      mutate(VISITCD = case_when(
+        AVISIT == 1 ~ "001",
+        AVISIT == 6 ~ "006"
+      )) %>%
+      rename(C3Comp = VALUE) %>%
+      select(BID, VISITCD, C3Comp),
+    by = c("BID", "VISITCD")
+  ) %>%
+  # Add PTAU data (assuming it's baseline only)
+  left_join(
+    PTAU217 %>%
+      select(BID, ORRES) %>%
+      distinct(BID, .keep_all = TRUE),
+    by = "BID"
+  ) %>%
+  # Add participant characteristics
+  left_join(
+    SUBJINFO %>%
+      select(BID, TX, AGEYR, SEX, RACE, EDCCNTU, SUVRCER, APOEGNPRSNFLG),
+    by = "BID"
+  ) %>%
+  mutate(
+    VISIT = case_when(
+      VISITCD == "001" ~ "Baseline",
+      VISITCD == "006" ~ "Visit 6"
+    )
+  )
+
+# Display the structure
+str(combined_long)
+```
+
+```{r data-check}
+#| message: false
+# Check data completeness
+cat("Sample sizes for each variable:\n")
+# First, let's see what columns actually exist
+cognitive_cols <- names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))]
+cat("Available columns with cognitive tests:\n")
+print(cognitive_cols)
+
+# Now select only existing columns
+combined_dataset %>%
+  select(all_of(cognitive_cols)) %>%
+  summarise_all(~sum(!is.na(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N") %>%
+  arrange(cognitive_cols) %>%
+  print(n = Inf)
+```
+
+
+# C3 W/ No NAs
+```{r extract-variables}
+#| message: false
+
+# Extract cognitive/functional variables from ADQS
+# Get both Visit 1 (baseline) and Visit 6 (endpoint) data
+ADQS_cognitive <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(
+    names_from = c(QSTESTCD, VISITCD),
+    values_from = QSSTRESN,
+    names_sep = "_V"
+  ) %>%
+  # Rename columns for clarity
+  rename_with(~ str_replace(.x, "_V001", "_V1"), everything()) %>%
+  rename_with(~ str_replace(.x, "_V006", "_V6"), everything())
+
+# Check what columns were created
+cat("ADQS_cognitive columns created:\n")
+print(names(ADQS_cognitive))
+
+# Extract C3Comp from COGSTATE
+# First, let's debug what's in the COGSTATE dataset
+cat("Debugging COGSTATE dataset:\n")
+cat("Unique TESTCD values:\n")
+print(unique(COGSTATE$TESTCD))
+cat("Unique AVISIT values:\n")
+print(unique(COGSTATE$AVISIT))
+
+# Check for C3 specifically
+cat("Records with TESTCD containing 'C3':\n")
+c3_records <- COGSTATE %>% filter(grepl("C3", TESTCD, ignore.case = TRUE))
+print(unique(c3_records$TESTCD))
+
+# Check the first few records
+cat("First few C3 records:\n")
+print(head(c3_records))
+
+# Filter for relevant visits if needed
+COGSTATE_data <- COGSTATE %>%
+  filter(AVISIT %in% c(1, 6)) %>%
+  filter(TESTCD == "C3Comp") %>%  # Use grepl in case it's not exactly "C3"
+  select(BID, AVISIT, VALUE, TESTCD) %>%
+  pivot_wider(
+    names_from = AVISIT,
+    values_from = VALUE,
+    names_prefix = "C3Comp_V"
+  ) %>%
+  select(-TESTCD)  # Remove TESTCD after pivot
+
+# Check what columns were created
+cat("COGSTATE_data columns created:\n")
+print(names(COGSTATE_data))
+cat("Sample of COGSTATE_data:\n")
+print(head(COGSTATE_data))
+
+# Extract ORRES from PTAU217
+# Assuming this might be visit-specific as well
+PTAU_data <- PTAU217 %>%
+  select(BID, ORRES) %>%
+  # If there are multiple records per BID, you might need to filter by visit
+  # or take the first/last value - adjust as needed
+  distinct(BID, .keep_all = TRUE)
+
+# Combine all datasets
+combined_dataset <- SUBJINFO %>%
+  left_join(ADQS_cognitive, by = "BID") %>%
+  left_join(COGSTATE_data, by = "BID") %>%
+  left_join(PTAU_data, by = "BID") %>%
+  # Remove duplicate baseline variables that already exist in SUBJINFO
+  select(-any_of(c("CFISP", "CFIPT", "ADLPQSP", "ADLPQPT")))
+
+# Display the structure of the combined dataset
+cat("Combined dataset structure:\n")
+str(combined_dataset)
+
+# Show all column names related to cognitive tests
+cat("\nAll cognitive test columns in combined dataset:\n")
+print(names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))])
+
+# Show summary of key variables
+cognitive_cols <- names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))]
+cat("\nSummary of cognitive test variables:\n")
+summary(combined_dataset %>% 
+        select(all_of(cognitive_cols)))
+```
+
+```{r alternative-long-format}
+#| message: false
+# Alternative: Create a long format dataset for longitudinal analysis
+combined_long <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(names_from = QSTESTCD, values_from = QSSTRESN) %>%
+  # Add COGSTATE data
+  left_join(
+    COGSTATE %>%
+      filter(AVISIT %in% c(1, 6)) %>%
+      filter(TESTCD == "C3Comp") %>%
+      select(BID, AVISIT, VALUE) %>%
+      mutate(VISITCD = case_when(
+        AVISIT == 1 ~ "001",
+        AVISIT == 6 ~ "006"
+      )) %>%
+      rename(C3Comp_Val = VALUE) %>%
+      select(BID, VISITCD, C3Comp_Val),
+    by = c("BID", "VISITCD")
+  ) %>%
+  # Add PTAU data (assuming it's baseline only)
+  left_join(
+    PTAU217 %>%
+      select(BID, ORRES) %>%
+      distinct(BID, .keep_all = TRUE),
+    by = "BID"
+  ) %>%
+  # Add participant characteristics
+  left_join(
+    SUBJINFO %>%
+      select(BID, TX, AGEYR, SEX, RACE, EDCCNTU, SUVRCER, APOEGNPRSNFLG),
+    by = "BID"
+  ) %>%
+  mutate(
+    VISIT = case_when(
+      VISITCD == "001" ~ "Baseline",
+      VISITCD == "006" ~ "Visit 6"
+    )
+  )
+
+# Display the structure
+head(combined_long)
+```
+
+```{r data-check}
+#| message: false
+# Check data completeness
+cat("Sample sizes for each variable:\n")
+# First, let's see what columns actually exist
+cognitive_cols <- names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))]
+cat("Available columns with cognitive tests:\n")
+print(cognitive_cols)
+
+# Now select only existing columns
+combined_dataset %>%
+  select(all_of(cognitive_cols)) %>%
+  summarise_all(~sum(!is.na(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N") %>%
+  arrange(desc(N)) %>%
+  print(n = Inf)
+```
+
+## Attempt 2
+
+```{r extract-variables}
+#| message: false
+
+# Extract cognitive/functional variables from ADQS
+# Get both Visit 1 (baseline) and Visit 6 (endpoint) data
+ADQS_cognitive <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(
+    names_from = c(QSTESTCD, VISITCD),
+    values_from = QSSTRESN,
+    names_sep = "_V"
+  ) %>%
+  # Rename columns for clarity
+  rename_with(~ str_replace(.x, "_V001", "_V1"), everything()) %>%
+  rename_with(~ str_replace(.x, "_V006", "_V6"), everything())
+
+# Check what columns were created
+cat("ADQS_cognitive columns created:\n")
+print(names(ADQS_cognitive))
+
+# Extract C3Comp from COGSTATE
+# First, let's debug what's happening with C3Comp data
+cat("Debugging C3Comp extraction:\n")
+c3_data <- COGSTATE %>% filter(TESTCD == "C3Comp")
+cat("Total C3Comp records:", nrow(c3_data), "\n")
+cat("Unique AVISIT values for C3Comp:\n")
+print(unique(c3_data$AVISIT))
+cat("Sample of C3Comp data:\n")
+print(head(c3_data %>% select(BID, AVISIT, VALUE, TESTCD)))
+
+# Count records by visit
+cat("C3Comp records by AVISIT:\n")
+print(table(c3_data$AVISIT, useNA = "always"))
+
+# Filter for relevant visits if needed
+COGSTATE_data <- COGSTATE %>%
+  filter(AVISIT %in% c(1, 6)) %>%
+  filter(TESTCD == "C3Comp") %>%
+  select(BID, AVISIT, VALUE) %>%
+  pivot_wider(
+    names_from = AVISIT,
+    values_from = VALUE
+  )
+
+# Check what columns were created and sample data
+cat("COGSTATE_data columns created:\n")
+print(names(COGSTATE_data))
+cat("Number of rows in COGSTATE_data:", nrow(COGSTATE_data), "\n")
+cat("Sample of COGSTATE_data:\n")
+print(head(COGSTATE_data))
+cat("Summary of C3Comp values:\n")
+summary(COGSTATE_data)
+
+# Extract ORRES from PTAU217
+# Assuming this might be visit-specific as well
+PTAU_data <- PTAU217 %>%
+  select(BID, ORRES) %>%
+  # If there are multiple records per BID, you might need to filter by visit
+  # or take the first/last value - adjust as needed
+  distinct(BID, .keep_all = TRUE)
+
+# Combine all datasets
+combined_dataset <- SUBJINFO %>%
+  left_join(ADQS_cognitive, by = "BID") %>%
+  left_join(COGSTATE_data, by = "BID") %>%
+  left_join(PTAU_data, by = "BID") %>%
+  # Remove duplicate baseline variables that already exist in SUBJINFO
+  select(-any_of(c("CFISP", "CFIPT", "ADLPQSP", "ADLPQPT")))
+
+# Display the structure of the combined dataset
+cat("Combined dataset structure:\n")
+str(combined_dataset)
+
+# Show all column names related to cognitive tests
+cat("\nAll cognitive test columns in combined dataset:\n")
+print(names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))])
+
+# Show summary of key variables
+cognitive_cols <- names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))]
+cat("\nSummary of cognitive test variables:\n")
+summary(combined_dataset %>% 
+        select(all_of(cognitive_cols)))
+```
+
+```{r alternative-long-format}
+#| message: false
+# Alternative: Create a long format dataset for longitudinal analysis
+# First, let's debug the COGSTATE join issue
+cat("Debugging COGSTATE join for long format:\n")
+cogstate_for_join <- COGSTATE %>%
+  filter(AVISIT %in% c(1, 6)) %>%
+  filter(TESTCD == "C3Comp") %>%
+  select(BID, AVISIT, VALUE) %>%
+  mutate(VISITCD = case_when(
+    AVISIT == 1 ~ "001",
+    AVISIT == 6 ~ "006"
+  )) %>%
+  rename(C3Comp = VALUE) %>%
+  select(BID, VISITCD, C3Comp)
+
+cat("COGSTATE data prepared for join:\n")
+print(head(cogstate_for_join))
+cat("Number of rows:", nrow(cogstate_for_join), "\n")
+cat("Unique VISITCD values:", unique(cogstate_for_join$VISITCD), "\n")
+
+# Check what ADQS visits we have
+adqs_visits <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD) %>%
+  distinct()
+
+cat("ADQS visits available:\n")
+print(head(adqs_visits))
+cat("Number of unique BID-VISITCD combinations in ADQS:", nrow(adqs_visits), "\n")
+
+# Check overlap
+cat("Sample BIDs in COGSTATE:", head(cogstate_for_join$BID), "\n")
+cat("Sample BIDs in ADQS:", head(adqs_visits$BID), "\n")
+
+combined_long <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(names_from = QSTESTCD, values_from = QSSTRESN) %>%
+  # Add COGSTATE data
+  left_join(cogstate_for_join, by = c("BID", "VISITCD")) %>%
+  # Add PTAU data (assuming it's baseline only)
+  left_join(
+    PTAU217 %>%
+      select(BID, ORRES) %>%
+      distinct(BID, .keep_all = TRUE),
+    by = "BID"
+  ) %>%
+  # Add participant characteristics
+  left_join(
+    SUBJINFO %>%
+      select(BID, TX, AGEYR, SEX, RACE, EDCCNTU, SUVRCER, APOEGNPRSNFLG),
+    by = "BID"
+  ) %>%
+  mutate(
+    VISIT = case_when(
+      VISITCD == "001" ~ "Baseline",
+      VISITCD == "006" ~ "Visit 6"
+    )
+  )
+
+# Check the result
+cat("Final combined_long dataset:\n")
+cat("Number of rows:", nrow(combined_long), "\n")
+cat("C3Comp summary:\n")
+summary(combined_long)
+
+# Display the structure
+str(combined_long)
+```
+
+```{r}
+# Corrected extraction based on actual COGSTATE structure
+
+# Based on your output, AVISIT "001" = Visit 1 (baseline)
+# and AVISIT "015" appears to correspond to Visit 6
+# Let's verify this mapping first
+
+cat("Verifying VISIT to AVISIT mapping for C3Comp:\n")
+visit_map <- COGSTATE %>%
+  filter(TESTCD == "C3Comp") %>%
+  distinct(VISIT, AVISIT) %>%
+  arrange(VISIT)
+print(visit_map)
+
+# Extract C3Comp from COGSTATE with correct AVISIT values
+COGSTATE_data <- COGSTATE %>%
+  filter(AVISIT %in% c("001", "015")) %>%  # Visit 1 and Visit 6
+  filter(TESTCD == "C3Comp") %>%
+  select(BID, AVISIT, VALUE) %>%
+  mutate(
+    # Create standardized visit labels
+    visit_label = case_when(
+      AVISIT == "001" ~ "V1",
+      AVISIT == "015" ~ "V6"
+    )
+  ) %>%
+  select(-AVISIT) %>%
+  pivot_wider(
+    names_from = visit_label,
+    values_from = VALUE,
+    names_prefix = "C3Comp_"
+  )
+
+cat("\nCOGSTATE_data structure:\n")
+str(COGSTATE_data)
+cat("\nNumber of subjects with C3Comp data:", nrow(COGSTATE_data), "\n")
+
+# For the long format - map AVISIT to VISITCD
+cogstate_for_join <- COGSTATE %>%
+  filter(TESTCD == "C3Comp") %>%
+  filter(AVISIT %in% c("001", "015")) %>%
+  mutate(
+    # Map AVISIT to VISITCD to match ADQS format
+    VISITCD = case_when(
+      AVISIT == "001" ~ "001",  # Baseline
+      AVISIT == "015" ~ "006"   # Visit 6 (week 15 maps to visit 6)
+    )
+  ) %>%
+  select(BID, VISITCD, VALUE) %>%
+  rename(C3Comp = VALUE)
+
+cat("\nCOGSTATE long format data:\n")
+print(head(cogstate_for_join))
+
+# Complete pipeline for combining datasets
+# Extract cognitive/functional variables from ADQS
+ADQS_cognitive <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(
+    names_from = c(QSTESTCD, VISITCD),
+    values_from = QSSTRESN,
+    names_sep = "_V"
+  ) %>%
+  rename_with(~ str_replace(.x, "_V001", "_V1"), everything()) %>%
+  rename_with(~ str_replace(.x, "_V006", "_V6"), everything())
+
+# Extract ORRES from PTAU217
+PTAU_data <- PTAU217 %>%
+  select(BID, ORRES) %>%
+  distinct(BID, .keep_all = TRUE)
+
+# Combine all datasets (wide format)
+combined_dataset <- SUBJINFO %>%
+  left_join(ADQS_cognitive, by = "BID") %>%
+  left_join(COGSTATE_data, by = "BID") %>%
+  left_join(PTAU_data, by = "BID") %>%
+  select(-any_of(c("CFISP", "CFIPT", "ADLPQSP", "ADLPQPT")))
+
+# Create long format dataset
+combined_long <- ADQS_raw %>%
+  filter(VISITCD %in% c("001", "006")) %>%
+  filter(QSTESTCD %in% c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                         "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")) %>%
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(names_from = QSTESTCD, values_from = QSSTRESN) %>%
+  # Add COGSTATE data
+  left_join(cogstate_for_join, by = c("BID", "VISITCD")) %>%
+  # Add PTAU data
+  left_join(
+    PTAU217 %>%
+      select(BID, ORRES) %>%
+      distinct(BID, .keep_all = TRUE),
+    by = "BID"
+  ) %>%
+  # Add participant characteristics
+  left_join(
+    SUBJINFO %>%
+      select(BID, TX, AGEYR, SEX, RACE, EDCCNTU, SUVRCER, APOEGNPRSNFLG),
+    by = "BID"
+  ) %>%
+  mutate(
+    VISIT = case_when(
+      VISITCD == "001" ~ "Baseline",
+      VISITCD == "006" ~ "Visit 6"
+    )
+  )
+
+# Verify the results
+cat("\n--- Final Results ---\n")
+cat("Combined dataset dimensions:", dim(combined_dataset), "\n")
+
+# Check C3Comp columns
+c3_cols <- names(combined_dataset)[grepl("C3Comp", names(combined_dataset))]
+cat("\nC3Comp columns in wide format:", paste(c3_cols, collapse = ", "), "\n")
+
+if(length(c3_cols) > 0) {
+  cat("\nC3Comp data summary (wide format):\n")
+  print(summary(combined_dataset[c3_cols]))
+}
+
+cat("\nC3Comp summary in long format:\n")
+print(summary(combined_long$C3Comp))
+
+# Check completeness
+cat("\nData completeness check:\n")
+cognitive_cols <- names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))]
+
+combined_dataset %>%
+  select(all_of(cognitive_cols)) %>%
+  summarise_all(~sum(!is.na(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N") %>%
+  arrange(desc(N)) %>%
+  print(n = Inf)
+glimpse(combined_long)
+```
+
+```{r data-check}
+#| message: false
+# Check data completeness
+cat("Sample sizes for each variable:\n")
+# First, let's see what columns actually exist
+cognitive_cols <- names(combined_dataset)[grepl("CFISP|CFIPT|CFITOTAL|PACC|MMSE|ADLPQ|ADLTOTAL|DIGITTOTAL|C3Comp|ORRES", names(combined_dataset))]
+cat("Available columns with cognitive tests:\n")
+print(cognitive_cols)
+
+# Now select only existing columns
+combined_dataset %>%
+  select(all_of(cognitive_cols)) %>%
+  summarise_all(~sum(!is.na(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N") %>%
+  arrange(desc(N)) %>%
+  print(n = Inf)
+summary(combined_dataset)
+```
