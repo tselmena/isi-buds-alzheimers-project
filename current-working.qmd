@@ -1,0 +1,287 @@
+---
+title: "day2-table1-demographic"
+format: html
+author: "Tselmen Anuurad"
+---
+
+```{r}
+library(tidyverse)
+library(table1)
+library(dplyr)
+library(tidyr) 
+library(purrr) 
+```
+
+```{r}
+# Read data, assuming your file is located in folder A4_ClinicalData
+SUBJINFO_raw <- read_csv("Derived Data/SUBJINFO.csv")
+ADQS_raw <- read_csv("Derived Data/ADQS.csv")
+SPINFO_raw <- read_csv("Raw Data/spinfo.csv")
+CDR_raw <- read_csv("Raw Data/cdr.csv")
+```
+
+## Data manipulations (FROM VIGNETTE)
+
+```{r data-manipulation}
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "001") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "006") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw %>%
+  left_join(V6OUTCOME, by = "BID") %>%
+  left_join(V1OUTCOME %>%
+      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") %>%
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+
+# Filter ADQS_raw for PACC collected in the blinded phases among mITT population
+ADQS_PACC <- ADQS_raw %>%
+  filter(MITTFL== 1) %>%
+  filter(EPOCH == "BLINDED TREATMENT" | AVISIT == "006") %>%
+  filter(QSTESTCD == "PACC") %>%
+  rename(PACC = QSSTRESN) %>%
+  select(BID, ASEQNCS, TX, ADURW, TX, AGEYR, 
+    AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) %>%
+  mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) %>%
+  na.omit()
+```
+
+
+## Study Partner Table 1
+
+```{r}
+# placebo group SUBJINFO
+SUBJINFO_PLAC <- SUBJINFO |> 
+  filter(TX %in% "Placebo")
+
+# Join subject info with study partner info
+SUBJINFO_SPINFO <- left_join(SUBJINFO_PLAC, SPINFO_raw, by = "BID")
+
+# Note: some people have multiple study partners 
+# 591 obs -> 709 obs in joined dataframe 
+NUMSTUDYPARTNER <- 
+  SUBJINFO_SPINFO |> 
+  group_by(BID) |> 
+  summarise(
+    count = n()
+  ) |> 
+  arrange(desc(count))
+
+# data vis: number of study partners
+p <- NUMSTUDYPARTNER |> 
+  ggplot(aes(x = count)) +
+  geom_bar() +
+  labs(
+    title = "Number of Study Partners per Study Participant",
+    x = "Number of Study Partners",
+  ) +
+  theme_minimal()
+
+# print(p)
+
+# clean up study partner information for table 1
+SUBJINFO_SPINFO <- 
+  SUBJINFO_SPINFO |> 
+  mutate(
+    INFRELAT = factor(case_when(
+      INFRELAT == 1 ~ "Spouse", 
+      INFRELAT == 2 ~ "Adult child", 
+      INFRELAT == 3 ~ "Child-in-law", 
+      INFRELAT == 4 ~ "Other relative", 
+      INFRELAT == 5 ~ "Friend/Companion", 
+      INFRELAT == 6 ~ "Paid caregiver (specify)", 
+      INFRELAT == 7 ~ "Other (specify)", 
+    )), 
+    INFGENDER = factor(case_when(
+      INFGENDER == 1 ~ "Male",
+      INFGENDER == 2 ~ "Female"), levels = c("Male", "Female")), 
+    INFLIVE = factor(case_when(
+      INFLIVE == 1 ~ "Yes",
+      INFLIVE == 0 ~ "No"), levels = c("Yes", "No")), 
+    INFAGE = factor(case_when(
+      INFAGE == 1 ~ "Yes",
+      INFAGE == 0 ~ "No"), levels = c("Yes", "No"))
+    )
+SUBJINFO_SPINFO
+```
+
+``` {r}
+# relable
+label(SUBJINFO_SPINFO$AGEYR) <- "Age (y)"
+label(SUBJINFO_SPINFO$SEX) <- "Sex"
+label(SUBJINFO_SPINFO$RACE) <- "Race"
+label(SUBJINFO_SPINFO$ETHNIC) <- "Ethnicity"
+label(SUBJINFO_SPINFO$EDCCNTU) <- "Education (y)"
+label(SUBJINFO_SPINFO$MARITAL) <- "Marital Status"
+label(SUBJINFO_SPINFO$WRKRET) <- "Retirement Status"
+label(SUBJINFO_SPINFO$INFRELAT) <- "Study Partner Relationship"
+label(SUBJINFO_SPINFO$INFGENDER) <- "Study Partner Gender"
+label(SUBJINFO_SPINFO$INFAGE) <- "Study Partner Age > 90"
+label(SUBJINFO_SPINFO$INFAGESP) <- "Study Partner Age (Specify)"
+label(SUBJINFO_SPINFO$INFLIVE) <- "Lives with Study Partner"
+label(SUBJINFO_SPINFO$INFHRS) <- "Study Partner Hours Together (In-Person)"
+label(SUBJINFO_SPINFO$INFHRSOT) <- "Study Partner Hours Together (Remote)"
+
+# study partner table 1
+table1(~ AGEYR + SEX + RACE + ETHNIC + EDCCNTU + MARITAL + WRKRET + INFRELAT 
+       + INFGENDER + INFAGE + INFAGESP + INFLIVE + INFHRS + INFHRSOT| TX, 
+       data = SUBJINFO_SPINFO |> filter(MITTFL == 1),
+       overall = FALSE,
+       caption = "Table 1: Demographic Characteristics")
+```
+
+## Indicator Dataframe
+
+```{r}
+# exploratory analysis
+CDR_raw |>
+  filter(BID %in% "B17897488") |>
+  select(c("CDGLOBAL","CDADTC_DAYS_T0","CDDY", "CDEVENT", "CDOLEEVENT")) |>
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  )
+
+# get those that are placebo only
+placebo_bids <- SUBJINFO_PLAC$BID
+
+# prep raw CDR file for use
+CDR_ind <- CDR_raw |> 
+  select(c("BID", "CDGLOBAL","CDADTC_DAYS_T0")) |> 
+  filter(BID %in% placebo_bids) |>
+  filter(CDADTC_DAYS_T0 >= 0) |> 
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  ) |> 
+  filter(WEEK <= 250)
+
+# some data vis: plot of weeks
+weeks_plot <- 
+  CDR_ind |> 
+  ggplot(aes(x = WEEK)) +
+  geom_histogram()
+
+# defining our target weeks
+target_weeks <- c(48, 108, 168, 208, 240)
+
+# for each visit, find which target week it is closest to
+# then for each subject/target week pair, keep only the single closest visit
+CDR_closest_week <- CDR_ind |>
+  # create a temporary column that calculates the distance from the visit's week
+  # to of the target weeks
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) |>
+  unnest(distance_to_target) |>
+  # group by the original visit to find the minimum distance
+  group_by(BID, WEEK, CDGLOBAL) |>
+  # identify which target week corresponds to that minimum distance
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) |>
+  # for each subject and each target week, find the single visit that was closest
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup()
+
+# one row per subject, with columns for the CDGLOBAL SCORE at each target week
+wide_cdr <- CDR_closest_week |>
+  select(BID, target_week, CDGLOBAL) |>
+  pivot_wider(
+    names_from = target_week,
+    values_from = CDGLOBAL,
+    names_prefix = "CDGLOBAL_W"
+  )
+
+# one row per subject, with columns for the CDGLOBAL INDICATOR at each target week
+wide_cdr_indicator <- CDR_closest_week |>
+  mutate(
+    CD_indicator = if_else(CDGLOBAL > 0, 1, 0)
+  ) |>
+  select(BID, target_week, CD_indicator) |> 
+  pivot_wider(
+    names_from = target_week,
+    values_from = CD_indicator, 
+    names_prefix = "CDPOS_W",   
+    values_fill = NA 
+  ) 
+
+# when is the first time of global cdr conversion?
+conversion_times <- 
+  CDR_closest_week |>
+  filter(CDGLOBAL > 0) |>
+  group_by(BID) |>
+  summarise(
+    CDRCONV_WEEK = min(WEEK)
+  )
+
+# final dataframe with indicator + min time to global cdr conversion
+wide_cdr_indicator <- left_join(wide_cdr_indicator, conversion_times, by = "BID") 
+wide_cdr_indicator |> 
+  summarise(
+    na = sum(is.na(CDPOS_W240))
+  )
+
+wide_cdr_indicator
+# table total number of ids w missing cdr scores at these weeks
+# unique ids with at least one missing values
+```
+
+## Regression Modeling
+
+```{r}
+
+```
+
+
+
+
+
+
+
