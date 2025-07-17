@@ -1,0 +1,652 @@
+---
+title: "a4 Study-day1"
+format: html
+---
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(arsenal)
+library(kableExtra)
+library(nlme)
+library(emmeans)
+library(splines)
+library(clubSandwich)
+library(table1)
+library(forcats)
+library(purrr)
+library(forestplot)
+library(broom)
+formatp <- function(x) case_when(
+  x < 0.001 ~ "p<0.001",
+  x > 0.01 ~ Hmisc::format.pval(x, digits=2, eps=0.01, nsmall=2),
+  TRUE ~ Hmisc::format.pval(x, digits=3, eps=0.001, nsmall=3))
+```
+
+```{r settings, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA, message = FALSE, 
+  warning = FALSE, cache = TRUE)
+
+a4Palette <- c("#0072b5", "#bc3c29")
+scale_colour_discrete <-
+  function(...) scale_colour_manual(..., values = a4Palette)
+scale_fill_discrete <-
+  function(...) scale_fill_manual(..., values = a4Palette)
+
+theme_set(theme_bw() +
+  theme(legend.background = element_rect(fill="transparent")))
+```
+
+## Read data
+
+```{r read-data}
+# Participant characteristics data:
+cdr_raw<-read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/cdr.csv")
+cfi_raw<-read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/cfi.csv")
+SPINFO_raw <- read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/spinfo.csv")
+SUBJINFO_raw <- read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Derived Data/SUBJINFO.csv")
+# Longitudinal PACC data from Analysis Data Questionnaire Scores (ADQS):
+ADQS_raw <- read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Derived Data/ADQS.csv")
+```
+
+## Data manipulations
+
+```{r data-manipulation}
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "001") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "006") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw %>%
+  left_join(V6OUTCOME, by = "BID") %>%
+  left_join(V1OUTCOME %>%
+      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") %>%
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+
+# Filter ADQS_raw for PACC collected in the blinded phases among mITT population
+ADQS_PACC <- ADQS_raw %>%
+  filter(MITTFL== 1) %>%
+  filter(EPOCH == "BLINDED TREATMENT" | AVISIT == "006") %>%
+  filter(QSTESTCD == "PACC") %>%
+  rename(PACC = QSSTRESN) %>%
+  select(BID, ASEQNCS, TX, ADURW, TX, AGEYR, 
+    AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) %>%
+  mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) %>%
+  na.omit()
+```
+
+```{r table1}
+#Relable
+label(SUBJINFO$AGEYR) <- "Age (y)"
+label(SUBJINFO$EDCCNTU) <- "Education (y)"
+label(SUBJINFO$SUVRCER) <- "FBP SUVr"
+label(SUBJINFO$AMYLCENT) <- "FBP Centiloid"
+label(SUBJINFO$LMIIa) <- "LM Delayed Recall"
+label(SUBJINFO$MMSE) <- "MMSE"
+label(SUBJINFO$CFITOTAL) <- "CFI Combined"
+label(SUBJINFO$ADLPQSP) <- "ADL Partner"
+label(SUBJINFO$CDRSB) <- "CDR-SB"
+label(SUBJINFO$SEX) <- "Sex"
+label(SUBJINFO$RACE) <- "Racial categories"
+label(SUBJINFO$ETHNIC) <- "Ethnicity"
+label(SUBJINFO$MARITAL) <- "Marital Status"
+label(SUBJINFO$WRKRET) <- "Retirement Status"
+label(SUBJINFO$APOEGNPRSNFLG) <- "APOE e4"
+label(SUBJINFO$APOEGN) <- "APOE Genotype"
+
+table1(~ AGEYR + EDCCNTU + SEX + RACE + ETHNIC + MARITAL + WRKRET + 
+    SUVRCER + AMYLCENT + APOEGN + APOEGNPRSNFLG + 
+      PACC + LMIIa + MMSE + CFITOTAL + ADLPQSP + CDRSB | TX, data=SUBJINFO |> filter(MITTFL== 1))
+```
+
+
+```{r fig.width=12, fig.height=6}
+adqs_processed <- ADQS_raw |>
+  full_join(SUBJINFO, by = "BID") |>
+  filter(TX.y != "Solanezumab") |>
+  mutate(Visit_num = str_extract(VISIT, "Visit\\s\\d+") |> 
+           str_remove("Visit\\s") |> 
+           as.integer(),
+
+    Week_num = case_when(
+      str_detect(str_to_lower(VISIT), "baseline")  ~ "Baseline",
+      str_detect(str_to_lower(VISIT), "screening") ~ "Screening",
+      str_detect(VISIT, "wk\\d+") ~ str_extract(VISIT, "wk\\d+") |> 
+                                    str_remove("wk"), TRUE ~ NA_character_))
+
+subject_profiles <- adqs_processed |>
+  select(BID, Visit_num, Week_num, QSTESTCD, QSSTRESN) |>
+  arrange(BID, Visit_num, QSTESTCD)
+
+test_counts <- adqs_processed |>
+  group_by(BID, QSTESTCD) |>
+  summarize(Test_Count = n(), .groups = "drop")
+
+week_plot_data <- adqs_processed |>
+  mutate(Week_num_clean = case_when(Week_num == "Baseline" ~ 1,
+                                    Week_num == "Screening" ~ 6,
+                                    str_detect(Week_num, "^\\d+$") ~ as.numeric(Week_num),
+                                    TRUE ~ NA_real_)) |>
+  filter(!is.na(Week_num_clean)) |>
+  group_by(QSTESTCD, Week_num_clean) |>
+  summarize(Test_Count = n(), .groups = "drop") |>
+  distinct(QSTESTCD, Week_num_clean)
+
+
+plot_upload <- ggplot(week_plot_data, aes(
+  x = Week_num_clean, 
+  y = fct_reorder(QSTESTCD, Week_num_clean))) +
+  geom_point(shape = 4, size = 4, stroke = 1.5, color = "#94003a") + 
+  scale_x_continuous(limits = c(0, 240)) +
+  labs(title = "Test Administration Schedule",
+    x = "Week", y="") +
+  theme_minimal(base_size = 18) +
+  theme(plot.title = element_text(face = "bold", size = 22, hjust = 0.5),
+        axis.title.x = element_text(face = "bold", size = 18),
+        axis.title.y = element_text(face = "bold", size = 18),
+        axis.text = element_text(size = 14))
+
+ggsave("replication_plot.png", plot = plot_upload, width = 14, height = 10, dpi = 300, bg = "white")
+
+```
+
+```{r fig.width=20, fig.height=10, fig.cap="Table 2: Excluding participants in the Solanezumab treatment group. Each column represents a distinct test. Values reflect the average score per subject across all visits up to and including the year."}
+
+adqs_year_summary <- adqs_processed |>
+  mutate(Week_num_clean = case_when(
+    Week_num == "Baseline" ~ 1,
+    Week_num == "Screening" ~ 6,
+    str_detect(Week_num, "^\\d+$") ~ as.numeric(Week_num),
+    TRUE ~ NA_real_),
+    year = case_when(
+      str_to_lower(Week_num) %in% c("baseline", "screening") ~ "Year 0",
+      Week_num_clean <= 48 ~ "Year 1",
+      Week_num_clean > 48 & Week_num_clean <= 120 ~ "Year 2",
+      Week_num_clean > 120 & Week_num_clean <= 168 ~ "Year 3",
+      Week_num_clean > 168 ~ "Year 4",
+      TRUE ~ NA_character_),
+    year = factor(year, levels = c("Year 0", "Year 1", "Year 2", "Year 3", "Year 4"))) |>
+  filter(!is.na(year), TX.y != "Solanezumab")
+
+adqs_summarized <- adqs_year_summary |>
+  group_by(BID, year, QSTESTCD) |>
+  summarize(QSSTRESN = mean(QSSTRESN, na.rm = TRUE), .groups = "drop")
+
+adqs_wide <- adqs_summarized |>
+  pivot_wider(id_cols = c(BID, year), names_from = QSTESTCD, values_from = QSSTRESN)
+
+test_vars <- setdiff(names(adqs_wide), c("BID", "year"))
+labels <- paste("Test:", test_vars)
+names(labels) <- test_vars
+label(adqs_wide) <- c(BID = "Subject ID", year = "Year", labels)
+
+table1(~ . - BID - year | year, data = adqs_wide)
+```
+
+
+
+```{r}
+# placebo group SUBJINFO
+SUBJINFO_PLAC <- SUBJINFO |> 
+  filter(TX %in% "Placebo")
+
+# Join subject info with study partner info
+SUBJINFO_SPINFO <- left_join(SUBJINFO_PLAC, SPINFO_raw, by = "BID")
+
+# Note: some people have multiple study partners 
+# 591 obs -> 709 obs in joined dataframe 
+NUMSTUDYPARTNER <- 
+  SUBJINFO_SPINFO |> 
+  group_by(BID) |> 
+  summarise(
+    count = n()
+  ) |> 
+  arrange(desc(count))
+
+# data vis: number of study partners
+p <- NUMSTUDYPARTNER |> 
+  ggplot(aes(x = count)) +
+  geom_bar() +
+  labs(
+    title = "Number of Study Partners per Study Participant",
+    x = "Number of Study Partners",
+  ) +
+  theme_minimal()
+
+# print(p)
+
+# clean up study partner information for table 1
+SUBJINFO_SPINFO <- 
+  SUBJINFO_SPINFO |> 
+  mutate(
+    INFRELAT = factor(case_when(
+      INFRELAT == 1 ~ "Spouse", 
+      INFRELAT == 2 ~ "Adult child", 
+      INFRELAT == 3 ~ "Child-in-law", 
+      INFRELAT == 4 ~ "Other relative", 
+      INFRELAT == 5 ~ "Friend/Companion", 
+      INFRELAT == 6 ~ "Paid caregiver (specify)", 
+      INFRELAT == 7 ~ "Other (specify)", 
+    )), 
+    INFGENDER = factor(case_when(
+      INFGENDER == 1 ~ "Male",
+      INFGENDER == 2 ~ "Female"), levels = c("Male", "Female")), 
+    INFLIVE = factor(case_when(
+      INFLIVE == 1 ~ "Yes",
+      INFLIVE == 0 ~ "No"), levels = c("Yes", "No")), 
+    INFAGE = factor(case_when(
+      INFAGE == 1 ~ "Yes",
+      INFAGE == 0 ~ "No"), levels = c("Yes", "No"))
+    )
+SUBJINFO_SPINFO
+```
+
+
+```{r}
+# exploratory analysis
+cdr_raw |>
+  filter(BID %in% "B17897488") |>
+  select(c("CDGLOBAL","CDADTC_DAYS_T0","CDDY", "CDEVENT", "CDOLEEVENT")) |>
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  )
+
+# get those that are placebo only
+placebo_bids <- SUBJINFO_PLAC$BID
+
+# prep raw CDR file for use
+CDR_ind <- cdr_raw |> 
+  select(c("BID", "CDGLOBAL","CDADTC_DAYS_T0")) |> 
+  filter(BID %in% placebo_bids) |>
+  filter(CDADTC_DAYS_T0 >= 0) |> 
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  ) |> 
+  filter(WEEK <= 250)
+
+# some data vis: plot of weeks
+weeks_plot <- 
+  CDR_ind |> 
+  ggplot(aes(x = WEEK)) +
+  geom_histogram()
+
+# defining our target weeks
+target_weeks <- c(48, 108, 168, 208, 240)
+
+# for each visit, find which target week it is closest to
+# then for each subject/target week pair, keep only the single closest visit
+CDR_closest_week <- CDR_ind |>
+  # create a temporary column that calculates the distance from the visit's week
+  # to of the target weeks
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) |>
+  unnest(distance_to_target) |>
+  # group by the original visit to find the minimum distance
+  group_by(BID, WEEK, CDGLOBAL) |>
+  # identify which target week corresponds to that minimum distance
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) |>
+  # for each subject and each target week, find the single visit that was closest
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup()
+
+# one row per subject, with columns for the CDGLOBAL SCORE at each target week
+wide_cdr <- CDR_closest_week |>
+  select(BID, target_week, CDGLOBAL) |>
+  pivot_wider(
+    names_from = target_week,
+    values_from = CDGLOBAL,
+    names_prefix = "CDGLOBAL_W"
+  )
+
+# one row per subject, with columns for the CDGLOBAL INDICATOR at each target week
+wide_cdr_indicator <- CDR_closest_week |>
+  mutate(
+    CD_indicator = if_else(CDGLOBAL > 0, 1, 0)
+  ) |>
+  select(BID, target_week, CD_indicator) |> 
+  pivot_wider(
+    names_from = target_week,
+    values_from = CD_indicator, 
+    names_prefix = "CDPOS_W",   
+    values_fill = NA 
+  ) 
+
+# when is the first time of global cdr conversion?
+conversion_times <- 
+  CDR_closest_week |>
+  filter(CDGLOBAL > 0) |>
+  group_by(BID) |>
+  summarise(
+    CDRCONV_WEEK = min(WEEK)
+  )
+
+# final dataframe with indicator + min time to global cdr conversion
+wide_cdr_indicator <- left_join(wide_cdr_indicator, conversion_times, by = "BID") 
+wide_cdr_indicator |> 
+  summarise(
+    na = sum(is.na(CDPOS_W240))
+  )
+
+wide_cdr_indicator
+# table total number of ids w missing cdr scores at these weeks
+# unique ids with at least one missing values
+```
+```{r reusable logistic regression function}
+ # Keep baseline (0) for delta calculations, but analyze only weeks >= 40
+ # Match closest week
+ # Compute deltas
+ # Join with outcome
+ # Find delta columns
+process_and_model_delta_scores <- function(adqs_data, test_code, target_weeks, outcome_data, outcome_var) {
+  score_label <- tolower(test_code)
+
+ 
+  modeling_weeks <- target_weeks[target_weeks >= 40]
+  all_weeks <- sort(unique(c(0, modeling_weeks)))
+
+  test_data <- adqs_data |>
+    filter(QSTESTCD == test_code, TX == "Placebo") |>
+    select(BID, WEEK = ADURW, SCORE = QSSTRESN) |>
+    filter(!is.na(WEEK), !is.na(SCORE))
+ 
+  closest <- test_data |>
+    mutate(tmp = map(WEEK, ~ abs(.x - all_weeks)),
+           target_week = map_int(tmp, ~ all_weeks[which.min(.x)])) |>
+    select(-tmp) |>
+    group_by(BID, target_week) |>
+    slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+    ungroup()
+
+
+  wide_scores <- closest |>
+    select(BID, target_week, SCORE) |>
+    pivot_wider(id_cols = BID,
+                names_from = target_week,
+                values_from = SCORE,
+                names_prefix = paste0(score_label, "_W")) |>
+    mutate(across(.cols = all_of(paste0(score_label, "_W", modeling_weeks)),
+                  .fns = ~ . - get(paste0(score_label, "_W0")),
+                  .names = "delta_{.col}")) |>
+    rename_with(
+      ~ gsub(
+          paste0("^delta_", score_label, "_W"),
+          paste0("delta_", score_label, "_score_"),
+          .),
+      starts_with("delta_"))
+
+  
+  model_data <- wide_scores |>
+    inner_join(outcome_data |>
+                 select(BID, !!sym(outcome_var)), by = "BID") |>
+    filter(!is.na(.data[[outcome_var]]))
+
+  
+  delta_vars <- grep(paste0("delta_", score_label, "_score_"), names(model_data), value = TRUE)
+
+  # Fit univariate models
+  models <- lapply(delta_vars, function(var) {
+    formula <- as.formula(paste(outcome_var, "~", var))
+    glm(formula, data = model_data, family = binomial())})
+
+  names(models) <- delta_vars
+
+  # Extract Odds Ratios
+  results <- lapply(models, function(m) {
+    tidy(m, exponentiate = TRUE, conf.int = TRUE) |>
+      filter(term != "(Intercept)")}) |>
+    bind_rows(.id = "delta_var") |>
+    mutate(test = test_code) |>
+    rename(OddsRatio = estimate,
+      LowerCI = conf.low,
+      UpperCI = conf.high,
+      p_value = p.value) |>
+    select(test, delta_var, OddsRatio, LowerCI, UpperCI, p_value)
+return(results)
+}
+```
+
+```{r fig.height=10, fig.width=15}
+# Example using funntion to get results for CFI and PACC, then plotting the odd ratios for each time
+cfi_results <- process_and_model_delta_scores(adqs_data = ADQS_raw,
+  test_code = "CFITOTAL",
+  target_weeks = target_weeks,
+  outcome_data = wide_cdr_indicator,
+  outcome_var = "CDPOS_W240")
+
+pacc_results <- process_and_model_delta_scores(adqs_data = ADQS_raw,
+  test_code = "PACC",
+  target_weeks = target_weeks,
+  outcome_data = wide_cdr_indicator,
+  outcome_var = "CDPOS_W240")
+
+all_results <- bind_rows(cfi_results, pacc_results)
+
+test_order <- all_results |>
+  filter(delta_var >= 48) |>
+  group_by(test) |>
+  summarise(min_week = min(as.numeric(stringr::str_extract(delta_var, "\\d+"))), .groups = "drop") |>
+  arrange(min_week) |>
+  pull(test)
+
+all_results <- all_results |>
+  filter(delta_var >= 48) |>
+  mutate(test = factor(test, levels = test_order),
+         week_num = as.numeric(stringr::str_extract(delta_var, "\\d+")),
+         delta_var = factor(delta_var, levels = delta_var[order(week_num)]))
+
+ggplot(all_results, aes(x = delta_var, y = OddsRatio, color = test)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), position = position_dodge(width = 0.5), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  labs(x = "Delta Timepoint (Week)",
+       y = "Odds Ratio (95% CI)",
+       title = "Odds Ratios for Logistic Regression of CDR Conversion at Week 240",
+       color = "Test") +
+  theme_bw() +
+  facet_wrap(~ test, scales = "free_x") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10, face = "bold"),
+        legend.position = "none",
+        strip.background = element_rect(fill = "white"),
+        strip.text = element_text(face = "bold"))
+```
+## Regression Modeling
+
+```{r logistic regression}
+# This function finds the closest score measurement for a given subject at a target week. 
+# Compute deltas and combine across tests
+# Get all delta predictor columns to fit models
+target_weeks <- c(0, 48, 108, 168, 208, 240)
+non_baseline_weeks <- setdiff(target_weeks, 0)
+
+
+get_closest_score_data <- function(df, score_code, target_weeks) {
+  df_filtered <- df |>
+    filter(QSTESTCD == score_code, TX == "Placebo") |>
+    select(BID, WEEK = ADURW, score = QSSTRESN) |>
+    filter(!is.na(WEEK), !is.na(score))
+
+  if (nrow(df_filtered) == 0) return(NULL)
+
+  df_closest <- df_filtered |>
+    mutate(tmp = map(WEEK, ~ abs(.x - target_weeks)),
+           target_week = map_int(tmp, ~ target_weeks[which.min(.x)])) |>
+    select(-tmp) |>
+    group_by(BID, target_week) |>
+    slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+    ungroup()
+
+  df_wide <- df_closest |>
+    pivot_wider(id_cols = BID, names_from = target_week, values_from = score,
+                names_prefix = paste0(score_code, "_W")) |>
+    mutate(across(starts_with(paste0(score_code, "_W")), 
+                  ~ . - get(paste0(score_code, "_W0")), 
+                  .names = "delta_{.col}")) |>
+    rename_with(~ gsub(paste0("^delta_", score_code, "_W"), 
+                       paste0("delta_", tolower(score_code), "_w"), .), 
+                starts_with(paste0("delta_", score_code, "_W")))
+  return(df_wide)}
+
+# Define test codes of interest
+test_codes <- c("MMSE","ADLTOTAL","ADLPQPT","LMIIA","CFITOTAL","ADLPQSP","CFISP","PACC","DIGIT", "CFIPT")
+
+
+all_scores_deltas <- map_dfr(test_codes, function(code) {
+  get_closest_score_data(ADQS_raw, code, target_weeks)},
+  .id = "test_id") 
+
+
+model_data <- all_scores_deltas |>
+  inner_join(wide_cdr_indicator |> select(BID, CDPOS_W240), by = "BID") |>
+  filter(!is.na(CDPOS_W240))
+
+delta_vars <- model_data |>
+  select(starts_with("delta_")) |>
+  names()
+
+
+model_results <- lapply(delta_vars, function(delta_var) {
+  formula <- as.formula(paste("CDPOS_W240 ~", delta_var))
+  model <- tryCatch(glm(formula, data = model_data, family = binomial()),
+                    error = function(e) NULL,
+                    warning = function(w) invokeRestart("muffleWarning"))
+  if (is.null(model)) return(NULL)
+
+  tidy(model, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(delta_var = delta_var)}) |>
+  compact() |>  
+  bind_rows()
+
+final_model_results <- model_results |>
+  mutate(measure = str_extract(delta_var, "(?<=delta_)[a-z]+"),
+    week = as.integer(str_extract(delta_var, "\\d+$"))) |>
+  select(measure, week, OR = estimate, CI_low = conf.low, CI_high = conf.high, p.value)
+
+final_model_results |>
+  filter(week != 0) |>
+  mutate(OR = round(OR, 3), CI_low = round(CI_low, 3), CI_high = round(CI_high, 3),
+         p.value = signif(p.value, 3), pval_formatted = ifelse(p.value < 0.001,
+                                                               formatC(p.value, format = "e", digits = 2), round(p.value, 3))) |>
+  rename(`Cognitive Test` = measure) |>
+  mutate(`Cognitive Test` = toupper(`Cognitive Test`)) |>
+  arrange(`Cognitive Test`, week) |>
+  select(`Cognitive Test`, week, OR, CI_low, CI_high, pval_formatted) |>
+  kable(
+    caption = "Summary of Logistic Regression Odds Ratios by Cognitive Test (Weeks after Baseline)",
+    col.names = c("Cognitive Test", "Week", "Odds Ratio", "Lower 95% CI", "Upper 95% CI", "p-value"),
+    digits = 3,
+    align = "lccccr"
+  ) |>
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+
+```{r odds_ratio_graph, fig.width=15, fig.height=10}
+custom_colors <- c('#00429d', '#30479e', '#464c9e', '#58519e', '#67579d', '#755d9b', '#816399', '#8b6b95', '#558a4a')
+
+ggplot(final_model_results, aes(x = week, y = OR, color = measure)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 5) +
+  geom_hline(yintercept = 1, linetype = "dashed") + 
+  facet_wrap(~measure, scales = "free_y") +
+  scale_x_continuous(limits = c(40, NA)) +  
+  scale_color_manual(values = custom_colors) +
+  labs(title = "Odds Ratios for Cognitive Testing by Week After Baseline", x = "",
+       y = expression("Odds Ratio (" * e^{beta} * ")")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 18, face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12, face = "bold"),
+        strip.text = element_text(size = 14, face = "bold"))
+ggsave("cognitive_test_odds_ratios.png", width = 15, height = 10, units = "in", dpi = 300)
+
+```
+
+```{r forest_plot1, fig.height=20, fig.width=15}
+custom_test_order <- c("MMSE","ADLTOTAL","ADLPQPT","LMIIA","CFITOTAL","ADLPQSP","CFISP","PACC","DIGIT", "CFIPT")  
+
+final_model_results <- final_model_results |>
+  mutate(measure = toupper(measure),
+    measure = recode(measure,"FCSRT" = "FCSRT96",.default = measure),
+    measure = factor(measure, levels = toupper(custom_test_order)),
+    week_label = paste0("Week ", week),
+    measure_week = paste(measure, week_label, sep = " - ")) |>
+  arrange(measure, week) |>
+  mutate(measure_week = factor(measure_week, levels = rev(unique(measure_week))))
+# After converting measure to uppercase
+final_model_results |>
+  mutate(measure = toupper(measure)) |>
+  distinct(measure) |>
+  filter(!(measure %in% toupper(custom_test_order))) |>
+  pull(measure)
+
+
+
+forest_indicator <- final_model_results |>
+  filter(week >= 40) |>
+  ggplot(aes(x = OR, y = measure_week)) +
+  geom_point(aes(color = measure), size = 4, shape =15) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high, color = measure), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_log10() +
+  scale_color_viridis_d(option = "D") +
+  labs(title = "Forest Plot: Odds Ratios for Cognitive Testing (Weeks After Baseline)",
+    x = "Odds Ratio (log scale)",
+    y = "") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none",panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 10))
+
+ggsave(filename = "forest_plot.png", plot = forest_indicator, width = 15, height = 20, units = "in", dpi = 300)
+```
