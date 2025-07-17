@@ -1,0 +1,243 @@
+---
+title: "Visit 1-66 Sorted Data"
+format: html
+editor: visual
+---
+
+```{r packages, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+formatp <- function(x) case_when(
+  x < 0.001 ~ "p<0.001",
+  x > 0.01 ~ Hmisc::format.pval(x, digits=2, eps=0.01, nsmall=2),
+  TRUE ~ Hmisc::format.pval(x, digits=3, eps=0.001, nsmall=3))
+```
+
+## Read data
+
+```{r}
+#| message: false
+
+setwd('C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/Derived Data')
+# Participant characteristics data:
+SUBJINFO_raw <- read_csv("SUBJINFO.csv")
+
+# Longitudinal PACC data from Analysis Data Questionnaire Scores (ADQS):
+ADQS_raw <- read_csv("ADQS.csv")
+
+COGSTATE <- read_csv("COGSTATE_COMPUTERIZED.csv")
+```
+```{r}
+#| message: false
+
+setwd('C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/External Data')
+
+PTAU217 <- read_csv("biomarker_pTau217.csv")
+```
+
+```{r data-manipulation}
+#| include: false
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "001") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "006") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw %>%
+  left_join(V6OUTCOME, by = "BID") %>%
+  left_join(V1OUTCOME %>%
+      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") %>%
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+
+# Filter ADQS_raw for PACC collected in the blinded phases among mITT population
+ADQS_PACC <- ADQS_raw %>%
+  filter(MITTFL== 1) %>%
+  filter(EPOCH == "BLINDED TREATMENT" | AVISIT == "006") %>%
+  filter(QSTESTCD == "PACC") %>%
+  rename(PACC = QSSTRESN) %>%
+  select(BID, ASEQNCS, TX, ADURW, TX, AGEYR, 
+    AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) %>%
+  mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) %>%
+  na.omit()
+```
+
+# Visits 1 through 66
+```{r}
+# Create visit mapping and filter for visits 1-66
+visit_mapping <- COGSTATE |>
+  filter(TESTCD == "C3Comp") |>
+  distinct(AVISIT, VISIT) |>
+  rename(VISITCD = VISIT) |>
+  mutate(VISITCD = as.character(VISITCD)) |>
+  filter(as.numeric(VISITCD) >= 1 & as.numeric(VISITCD) <= 66)
+
+# Extract COGSTATE data for visits 1-66
+COGSTATE_data_long <- COGSTATE |>
+  filter(TESTCD == "C3Comp") |>
+  select(BID, AVISIT, VALUE) |>
+  left_join(visit_mapping, by = "AVISIT", relationship = "many-to-many") |>
+  filter(!is.na(VISITCD)) |>
+  transmute(BID, VISITCD, C3Comp = VALUE)
+
+# Extract ADQS data for visits 1-66
+target_tests <- c("CFISP", "CFIPT", "CFITOTAL", "PACC", "MMSE", 
+                  "ADLPQSP", "ADLPQPT", "ADLTOTAL", "DIGITTOTAL")
+existing_tests <- ADQS_raw |> 
+  distinct(QSTESTCD) |> 
+  pull(QSTESTCD) |> 
+  intersect(target_tests)
+
+ADQS_cognitive_long <- ADQS_raw |>
+  filter(QSTESTCD %in% existing_tests) |>
+  mutate(VISITCD = as.character(VISITCD)) |>
+  filter(as.numeric(VISITCD) >= 1 & as.numeric(VISITCD) <= 66) |>
+  select(BID, VISITCD, QSTESTCD, QSSTRESN) |>
+  pivot_wider(names_from = QSTESTCD, values_from = QSSTRESN)
+
+# PTAU data
+PTAU_data <- PTAU217 |>
+  select(BID, ORRES) |>
+  distinct(BID, .keep_all = TRUE)
+
+# Combined long-format dataset 
+combined_data <- ADQS_cognitive_long |>
+  full_join(COGSTATE_data_long, by = c("BID", "VISITCD")) |>
+  left_join(PTAU_data, by = "BID") |>
+  left_join(
+    SUBJINFO |>
+      select(BID, TX, AGEYR, SEX, RACE, EDCCNTU, SUVRCER, APOEGNPRSNFLG),
+    by = "BID"
+  ) |>
+  mutate(
+    VISIT_LABEL = case_when(
+      VISITCD == "001" ~ "Baseline",
+      VISITCD == "006" ~ "Visit 6",
+      TRUE ~ paste0("Visit ", as.numeric(VISITCD))
+    )
+  ) |>
+  arrange(BID, as.numeric(VISITCD))
+
+head(combined_data)
+
+# Summary stats for C3Comp
+cat(" C3Comp Summary:\n")
+summary(combined_data$C3Comp) |> print()
+
+```
+
+### Wide format with key visits and test measurements
+```{r}
+# Wide format for key visits 
+key_visits <- c("001", "006", "012", "018", "024", "030", "048", "060", "066")
+
+available_key_visits <- intersect(key_visits, unique(combined_data$VISITCD))
+existing_cog_cols <- intersect(
+  c("CFITOTAL", "PACC", "MMSE", "ADLTOTAL", "DIGITTOTAL", "C3Comp"),
+  names(combined_data)
+)
+existing_demo_cols <- intersect(
+  c("TX", "AGEYR", "SEX", "RACE", "EDCCNTU", "SUVRCER", "APOEGNPRSNFLG", "ORRES"),
+  names(combined_data)
+)
+
+combined_wide_key <- combined_data |>
+  filter(VISITCD %in% available_key_visits) |>
+  select(BID, VISITCD, all_of(existing_cog_cols), all_of(existing_demo_cols)) |>
+  pivot_wider(names_from = VISITCD, values_from = all_of(existing_cog_cols), names_sep = "_V") |>
+  distinct(BID, .keep_all = TRUE)
+
+head(combined_wide_key)
+```
+
+
+```{r}
+combined_data |>
+  mutate(
+    VISITNUM = as.numeric(VISITCD),
+    PACC = as.numeric(PACC)
+  ) |>
+  ggplot(aes(x = VISITNUM, y = PACC, group = BID)) +
+  geom_line(alpha = 0.15, color = "red") +
+  geom_smooth(aes(group = 1), method = "loess", se = TRUE, color = "blue", linewidth = 1.2) +
+  labs(
+    title = "Individual PACC Trajectories",
+    x = "Visit Number",
+    y = "PACC Score"
+  ) +
+  theme_minimal() 
+
+```
+```{r}
+combined_data |>
+  mutate(
+    VISITNUM = as.numeric(VISITCD),
+    MMSE = as.numeric(C3Comp)
+  ) |>
+  ggplot(aes(x = VISITNUM, y = C3Comp)) +
+  geom_smooth(method = "loess", se = T, color = "purple", linewidth = 1.2) +
+  geom_vline(xintercept = 6, linetype = "dashed", color = "red") +
+  labs(
+    title = "Average C3 Over Time",
+    x = "Visit Number",
+    y = "C3 Score"
+  ) +
+  theme_minimal() 
+```
+### Purpose of C3:
+The C3 is used to assess cognitive function in individuals with preclinical Alzheimer's disease, specifically those with evidence of amyloid accumulation in their brains but who do not yet exhibit noticeable symptoms. 
+
+### C3 as a Secondary Outcome:
+While the PACC is the primary outcome measure, the C3 serves as a secondary outcome, offering a more detailed and potentially sensitive assessment of cognitive changes over time. 
