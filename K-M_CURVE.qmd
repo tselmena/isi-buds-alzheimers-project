@@ -1,0 +1,418 @@
+---
+title: "K-M for CFI"
+format: html
+editor: visual
+---
+
+# CDR Progression Survival Analysis by CFI Quartiles
+
+## Goals:
+
+-   Plot time to progression of CDR for CFI PT/SP/TOTAL quartiles
+-   Compare survival curves across quartiles for each CFI measure
+
+## Setup and Libraries
+
+```{r setup}
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(gridExtra)
+
+```
+
+## Read Data & Manipulation
+
+```{r data-read}
+#| message: false
+setwd('C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/Derived Data')
+# Participant characteristics data:
+SUBJINFO_raw <- read_csv("SUBJINFO.csv")
+
+# Longitudinal PACC data from Analysis Data Questionnaire Scores (ADQS):
+ADQS_raw <- read_csv("ADQS.csv")
+
+SPINFO_raw <- read_csv("C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/spinfo.csv")
+
+CDR_raw <- read_csv("C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/cdr.csv")
+```
+
+```{r data-manipulation}
+#| include: false
+
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw |>
+  filter(VISITCD == "001") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "006") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw %>%
+  left_join(V6OUTCOME, by = "BID") %>%
+  left_join(V1OUTCOME %>%
+      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") %>%
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+
+# Filter for placebo group
+SUBJINFO_PLAC <- SUBJINFO %>% 
+  filter(TX %in% "Placebo")
+```
+
+## CDR Progression Data Preparation
+
+```{r cdr-prep}
+# Get placebo group BIDs
+placebo_bids <- SUBJINFO_PLAC$BID
+
+# Prep raw CDR file for use
+CDR_ind <- CDR_raw %>% 
+  select(c("BID", "CDGLOBAL", "CDADTC_DAYS_T0")) %>% 
+  filter(BID %in% placebo_bids) %>%
+  filter(CDADTC_DAYS_T0 >= 0) %>% 
+  mutate(WEEK = CDADTC_DAYS_T0 / 7) %>% 
+  filter(WEEK <= 250)
+
+# Define target weeks
+target_weeks <- c(48, 108, 168, 208, 240)
+
+# Find closest visits to target weeks
+CDR_closest_week <- CDR_ind %>%
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) %>%
+  unnest(distance_to_target) %>%
+  group_by(BID, WEEK, CDGLOBAL) %>%
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) %>%
+  group_by(BID, target_week) %>%
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) %>%
+  ungroup()
+
+# Find conversion times (first time CDGLOBAL > 0)
+conversion_times <- CDR_closest_week %>%
+  filter(CDGLOBAL > 0) %>%
+  group_by(BID) %>%
+  summarise(CDRCONV_WEEK = min(WEEK))
+```
+
+## Explore CFI Distributions
+
+```{r explore-cfi}
+# Check distributions of CFI variables
+
+cfi_summary <- SUBJINFO_PLAC %>%
+  select(CFITOTAL, CFISP, CFIPT) %>%
+  summarise(
+    across(everything(), list(
+      min = ~min(.x, na.rm = TRUE),
+      q25 = ~quantile(.x, 0.25, na.rm = TRUE),
+      median = ~median(.x, na.rm = TRUE),
+      q75 = ~quantile(.x, 0.75, na.rm = TRUE),
+      max = ~max(.x, na.rm = TRUE),
+      n_unique = ~n_distinct(.x, na.rm = TRUE)
+    ))
+  )
+
+cfi_summary
+
+# Check for ties at quartile boundaries
+ SUBJINFO_PLAC |>
+  select(CFITOTAL, CFISP, CFIPT) |>
+  summarise(
+    across(everything(), list(
+      q25 = ~quantile(.x, 0.25, na.rm = TRUE),
+      q50 = ~quantile(.x, 0.50, na.rm = TRUE),
+      q75 = ~quantile(.x, 0.75, na.rm = TRUE)
+    ))
+  ) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  separate(variable, into = c("cfi_type", "quartile"), sep = "_") |>
+  pivot_wider(names_from = quartile, values_from = value) |>
+  print()
+```
+
+## Create Survival Dataset with CFI Quartiles
+
+```{r survival-data}
+# Create survival dataset combining CDR conversion times with baseline CFI scores
+survival_data <- SUBJINFO_PLAC %>%
+  select(BID, CFITOTAL, CFISP, CFIPT) %>%
+  left_join(conversion_times, by = "BID") %>%
+  mutate(
+    # Create event indicator (1 = converted, 0 = censored)
+    event = ifelse(is.na(CDRCONV_WEEK), 0, 1),
+    # For non-converters, use maximum follow-up time (240 weeks)
+    time_to_event = ifelse(is.na(CDRCONV_WEEK), 240, CDRCONV_WEEK)
+  ) %>%
+  # Remove subjects with missing CFI data first
+  filter(!is.na(CFITOTAL) & !is.na(CFISP) & !is.na(CFIPT)) %>%
+  mutate(
+    # Use ntile() for more robust quartile creation
+    CFITOTAL_quartile = factor(ntile(CFITOTAL, 4), 
+                              labels = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)")),
+    
+    CFISP_quartile = factor(ntile(CFISP, 4), 
+                           labels = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)")),
+    
+    CFIPT_quartile = factor(ntile(CFIPT, 4), 
+                           labels = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"))
+  )
+
+# Summary of survival data
+cat("Survival Data Summary:\n")
+cat("Total subjects:", nrow(survival_data), "\n")
+cat("Events (CDR progression):", sum(survival_data$event), "\n")
+cat("Censored:", sum(1 - survival_data$event), "\n\n")
+
+# Check quartile distributions
+cat("Quartile Distributions:\n")
+survival_data %>%
+  select(ends_with("_quartile")) %>%
+  summary() %>%
+  print()
+```
+
+## Survival Analysis Results
+
+### CFI Total Score Quartiles
+
+```{r km-cfitotal}
+#| fig-height: 10
+#| fig-width: 12
+
+# Fit survival model for CFI Total
+km_cfitotal <- survfit(Surv(time_to_event, event) ~ CFITOTAL_quartile, data = survival_data)
+
+# Create plot using ggsurvplot
+p_cfitotal <- ggsurvplot(
+  km_cfitotal,
+  data = survival_data,
+  title = "Time to CDR Progression by CFI Total Score Quartiles",
+  xlab = "Time (weeks)",
+  ylab = "Progression-Free Survival",
+  xlim = c(0, 240),
+  break.time.by = 48,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.3,
+  risk.table.fontsize = 3.5,
+  ncensor.plot = FALSE,
+  conf.int = TRUE,
+  conf.int.alpha = 0.1,
+  pval = TRUE,
+  pval.size = 4,
+  legend.title = "CFI Total Quartiles",
+  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
+  palette = c("#2E8B57", "#4682B4", "#DAA520", "#DC143C"),
+  ggtheme = theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5),
+      legend.position = "top"
+    )
+)
+
+print(p_cfitotal)
+
+# Print survival summary
+cat("\nCFI Total - Survival Summary:\n")
+print(summary(km_cfitotal, times = c(48, 108, 168, 208, 240)))
+```
+
+### CFI Study Partner Quartiles
+
+```{r km-cfisp}
+#| fig-height: 10
+#| fig-width: 12
+
+# Fit survival model for CFI Study Partner
+km_cfisp <- survfit(Surv(time_to_event, event) ~ CFISP_quartile, data = survival_data)
+
+# Create plot using ggsurvplot
+p_cfisp <- ggsurvplot(
+  km_cfisp,
+  data = survival_data,
+  title = "Time to CDR Progression by CFI Study Partner Quartiles",
+  xlab = "Time (weeks)",
+  ylab = "Progression-Free Survival",
+  xlim = c(0, 240),
+  break.time.by = 48,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.3,
+  risk.table.fontsize = 3.5,
+  ncensor.plot = FALSE,
+  conf.int = TRUE,
+  conf.int.alpha = 0.1,
+  pval = TRUE,
+  pval.size = 4,
+  legend.title = "CFI Study Partner Quartiles",
+  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
+  palette = c("#2E8B57", "#4682B4", "#DAA520", "#DC143C"),
+  ggtheme = theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5),
+      legend.position = "top"
+    )
+)
+
+print(p_cfisp)
+
+# Print survival summary
+cat("\nCFI Study Partner - Survival Summary:\n")
+print(summary(km_cfisp, times = c(48, 108, 168, 208, 240)))
+```
+
+### CFI Patient Quartiles
+
+```{r km-cfipt}
+#| fig-height: 10
+#| fig-width: 12
+
+# Fit survival model for CFI Patient
+km_cfipt <- survfit(Surv(time_to_event, event) ~ CFIPT_quartile, data = survival_data)
+
+# Create plot using ggsurvplot
+p_cfipt <- ggsurvplot(
+  km_cfipt,
+  data = survival_data,
+  title = "Time to CDR Progression by CFI Patient Quartiles",
+  xlab = "Time (weeks)",
+  ylab = "Progression-Free Survival",
+  xlim = c(0, 240),
+  break.time.by = 48,
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.3,
+  risk.table.fontsize = 3.5,
+  ncensor.plot = FALSE,
+  conf.int = TRUE,
+  conf.int.alpha = 0.1,
+  pval = TRUE,
+  pval.size = 4,
+  legend.title = "CFI Patient Quartiles",
+  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
+  palette = c("#2E8B57", "#4682B4", "#DAA520", "#DC143C"),
+  ggtheme = theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0.5),
+      legend.position = "top"
+    )
+)
+
+print(p_cfipt)
+
+# Print survival summary
+cat("\nCFI Patient - Survival Summary:\n")
+print(summary(km_cfipt, times = c(48, 108, 168, 208, 240)))
+```
+
+## Statistical Tests
+
+```{r statistical-tests}
+# Log-rank tests for differences between quartiles
+cat("Log-rank Test Results:\n\n")
+
+cat("CFI Total Quartiles:\n")
+logrank_cfitotal <- survdiff(Surv(time_to_event, event) ~ CFITOTAL_quartile, data = survival_data)
+print(logrank_cfitotal)
+
+cat("\nCFI Study Partner Quartiles:\n")
+logrank_cfisp <- survdiff(Surv(time_to_event, event) ~ CFISP_quartile, data = survival_data)
+print(logrank_cfisp)
+
+cat("\nCFI Patient Quartiles:\n")
+logrank_cfipt <- survdiff(Surv(time_to_event, event) ~ CFIPT_quartile, data = survival_data)
+print(logrank_cfipt)
+```
+
+## Summary Statistics by Quartiles
+
+```{r summary-stats}
+# Create summary table
+summary_table <- survival_data %>%
+  pivot_longer(
+    cols = c(CFITOTAL_quartile, CFISP_quartile, CFIPT_quartile),
+    names_to = "CFI_type",
+    values_to = "quartile"
+  ) %>%
+  mutate(
+    CFI_type = case_when(
+      CFI_type == "CFITOTAL_quartile" ~ "CFI Total",
+      CFI_type == "CFISP_quartile" ~ "CFI Study Partner", 
+      CFI_type == "CFIPT_quartile" ~ "CFI Patient"
+    )
+  ) %>%
+  group_by(CFI_type, quartile) %>%
+  summarise(
+    N = n(),
+    Events = sum(event),
+    `Event Rate (%)` = round(100 * sum(event) / n(), 1),
+    `Median Time to Event` = ifelse(sum(event) > 0, 
+                                   median(time_to_event[event == 1]), 
+                                   NA),
+    .groups = "drop"
+  )
+
+print(summary_table)
+```
+
+## Key Findings
+
+The survival analysis reveals the relationship between baseline CFI scores and time to CDR progression:
+
+-   **Higher CFI scores** (worse cognitive function) are associated with **faster progression** to CDR \> 0
+-   **Q4 (worst function)** consistently shows the highest risk of progression
+-   **Q1 (best function)** shows the lowest risk of progression
+-   The **log-rank tests** indicate whether there are statistically significant differences between quartiles
+
+This analysis helps identify patients at higher risk for cognitive decline based on their baseline functional assessments.
