@@ -1,0 +1,1201 @@
+---
+title: "Day_01_ALZ_Research"
+format: html
+---
+# (Step 0)Initial Data R Load
+```{r}
+#| message: false
+library(tidyverse)
+library(arsenal)
+library(kableExtra)
+library(nlme)
+library(emmeans)
+library(splines)
+library(clubSandwich)
+library(table1)
+formatp <- function(x) case_when(
+x < 0.001~ "p<0.001",
+x > 0.01~ Hmisc::format.pval(x, digits=2, eps=0.01, nsmall=2),
+TRUE~ Hmisc::format.pval(x, digits=3, eps=0.001, nsmall=3))
+```
+# (Step 1) Read Data
+```{r}
+#| message: false
+# Participant characteristics data:
+SUBJINFO_raw <- read_csv("data/SUBJINFO.csv")
+# Longitudinal PACC data from Analysis Data Questionnaire Scores (ADQS):
+ADQS_raw <- read_csv("data/ADQS.csv")
+glimpse(ADQS_raw)
+```
+# (Step 2) Data Manipulations
+```{r}
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw %>%
+filter(VISITCD== "001") %>%
+select(BID, QSTESTCD, QSSTRESN) %>%
+pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+filter(VISITCD== "006") %>%
+select(BID, QSTESTCD, QSSTRESN) %>%
+pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+SUBJINFO <- SUBJINFO_raw %>%
+left_join(V6OUTCOME, by = "BID") %>%
+left_join(V1OUTCOME %>%
+select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP),
+by = "BID") %>%
+mutate(
+AGECAT = case_when(AGEYR < 65~ "Age < 65",
+AGEYR >= 65 & AGEYR < 75~ "65 <= Age < 75",
+AGEYR >= 75 & AGEYR < 85~ "75 <= Age < 85",
+AGEYR >= 85~ "Age >= 85"),
+SEX = factor(case_when(
+SEX== 1~ "Female",
+SEX== 2~ "Male"), levels = c("Male", "Female")),
+RACE = case_when(RACE== 1~ "White",
+RACE== 2~ "Black or African American",
+RACE== 58~ "Asian",
+RACE== 79~ "Native Hawaiian or Other Pacific Islander",
+RACE== 84~ "American Indian or Alaskan Native",
+RACE== 97~ "Unknown or Not Reported",
+RACE== 100~ "More than one race"),
+MARITAL = case_when(MARITAL== 2~ "Divorced",
+MARITAL== 4~ "Never married",
+MARITAL== 5~ "Widowed",
+MARITAL== 11~ "Married",
+MARITAL== 97~ "Unknown or Not Reported"),
+ETHNIC = case_when(ETHNIC== 50~ "Hispanic or Latino",
+ETHNIC== 56~ "Not Hispanic or Latino",
+ETHNIC== 97~ "Unknown or Not reported"),
+ALCHLBL = case_when(ALCHLBL== 0~ "No",
+ALCHLBL== 1~ "Yes"),
+CFBL = case_when(CFBL== 0~ "No",
+CFBL== 1~ "Yes"),
+TBBL = case_when(TBBL== 0~ "No",
+TBBL== 1~ "Yes"),
+WRKRET = case_when(WRKRET== 1~ "Yes",
+WRKRET== 0~ "No",
+WRKRET== 96~ "Not Applicable"),
+APOEGNPRSNFLG = case_when(APOEGNPRSNFLG== 1~ "Yes",
+APOEGNPRSNFLG== 0~ "No"),
+AGEYR = as.numeric(AGEYR),
+SUVRCER = as.numeric(SUVRCER),
+AMYLCENT = as.numeric(AMYLCENT),
+EDCCNTU = as.numeric(EDCCNTU),
+COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+COMPLETER_label = case_when(
+SUBJCOMPTR== 1~ "Completer",
+TRUE~ "Dropout"))
+# Filter ADQS_raw for PACC collected in the blinded phases among mITT population
+ADQS_PACC <- ADQS_raw %>%
+filter(MITTFL== 1) %>%
+filter(EPOCH== "BLINDED TREATMENT" | AVISIT== "006") %>%
+filter(QSTESTCD== "PACC") %>%
+rename(PACC = QSSTRESN) %>%
+select(BID, ASEQNCS, TX, ADURW, TX, AGEYR,
+AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) %>%
+mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) %>%
+na.omit()
+```
+# (Step 3) Baseline Demographics
+```{r table1, results="asis"}
+# baseline stuff
+#this is how it works
+#| message: false
+A4labels <- list(TX = "Treatment group", AGEYR = "Age (y)",
+EDCCNTU = "Education (y)", SUVRCER = "FBP SUVr", AMYLCENT = "FBP Centiloid",
+LMIIa = "LM Delayed Recall", MMSE = "MMSE",
+CFITOTAL = "CFI Combined", ADLPQSP = "ADL Partner", CDRSB = "CDR-SB",
+SEX = "Sex", RACE = "Racial categories", ETHNIC = "Ethnicity",
+MARITAL = "Marital Status", WRKRET = "Retirement Status",
+APOEGNPRSNFLG = "APOE e4", APOEGN = "APOE Genotype")
+table1 <- tableby(TX~ AGEYR + EDCCNTU + SEX + RACE + ETHNIC + MARITAL + WRKRET +
+SUVRCER + AMYLCENT + chisq(APOEGN) + chisq(APOEGNPRSNFLG) +
+PACC + LMIIa + MMSE + CFITOTAL + ADLPQSP + CDRSB,
+data = SUBJINFO %>% filter(MITTFL== 1),
+control = tableby.control(test=TRUE,
+stats.labels = list(Nmiss = "Missing")))
+if(knitr::is_latex_output()){
+  # format table for pdf document
+  table1 %>%
+    summary(labelTranslations = A4labels, digits = 1, text = "latex") %>%
+    kable(format="latex", escape = FALSE, longtable = T, booktabs = TRUE,
+          linesep = "", row.names = FALSE,
+          caption = "Baseline characteristics.") %>%
+    kable_styling(latex_options = c("HOLD_position", "repeat_header")) %>%
+    column_spec(1, width = "17 em") %>%
+    column_spec(2:4, width = "6 em")
+}
+
+if(knitr::is_html_output()){
+  # This will run during interactive execution
+  summary(table1, labelTranslations = A4labels, digits = 1, 
+          title = "Baseline Characteristics")
+}
+```
+```{r}
+table1(~ AGEYR + EDCCNTU + SEX + RACE + ETHNIC + MARITAL + WRKRET + 
+    SUVRCER + AMYLCENT + APOEGN + APOEGNPRSNFLG + 
+    PACC + LMIIa + MMSE + CFITOTAL + ADLPQSP + CDRSB | TX, data=SUBJINFO %>% filter(MITTFL== 1))
+```
+```{r}
+#| message: false
+#| include: false
+#Relabeling for format
+label(SUBJINFO$AGEYR) <- "Age (y)"
+label(SUBJINFO$EDCCNTU) <- "Education (y)"
+label(SUBJINFO$SUVRCER) <- "FBP SUVr"
+label(SUBJINFO$AMYLCENT) <- "FBP Centiloid"
+label(SUBJINFO$LMIIa) <- "LM Delayed Recall"
+label(SUBJINFO$MMSE) <- "MMSE"
+label(SUBJINFO$CFITOTAL) <- "CFI Combined"
+label(SUBJINFO$ADLPQSP) <- "ADL Partner"
+label(SUBJINFO$CDRSB) <- "CDR-SB"
+label(SUBJINFO$SEX) <- "Sex"
+label(SUBJINFO$RACE) <- "Racial categories"
+label(SUBJINFO$ETHNIC) <- "Ethnicity"
+label(SUBJINFO$MARITAL) <- "Marital Status"
+label(SUBJINFO$WRKRET) <- "Retirement Status"
+label(SUBJINFO$APOEGNPRSNFLG) <- "APOE e4"
+label(SUBJINFO$APOEGN) <- "APOE Genotype"
+
+table1(~ AGEYR + EDCCNTU + SEX + RACE + ETHNIC + MARITAL + WRKRET + 
+    SUVRCER + AMYLCENT + APOEGN + APOEGNPRSNFLG + 
+    PACC + LMIIa + MMSE + CFITOTAL + ADLPQSP + CDRSB | TX, data=SUBJINFO %>% filter(MITTFL== 1))
+```
+```{r}
+#| message: false
+table1(~ AGEYR + EDCCNTU + SEX + RACE + ETHNIC + MARITAL + WRKRET + 
+    SUVRCER + AMYLCENT + APOEGN + APOEGNPRSNFLG + 
+    PACC + LMIIa + MMSE + CFITOTAL + ADLPQSP + CDRSB | TX, data=SUBJINFO %>% filter(MITTFL== 1),
+     caption = "Table 1: Demographic Characteristics")
+```
+```{r}
+# Labeling
+label(SUBJINFO$AGEYR) <- "Age (years)"
+label(SUBJINFO$EDCCNTU) <- "Education (years)"
+#This is the code to do this
+# Gives basic demographic table to understand base population
+
+table1(~ AGEYR + SEX + RACE + ETHNIC + EDCCNTU + MARITAL + WRKRET | TX, 
+       data = SUBJINFO |> filter(MITTFL == 1 & TX == "Placebo"),
+       overall = FALSE,
+        caption = "Table 1: Demographic Characteristics")
+```
+
+```{r}
+#Subject info data
+SUBJINFO <- read_csv("data/SUBJINFO.csv")
+SPINFO_raw <- read_csv("data/spinfo.csv")
+# placebo group SUBJINFO
+SUBJINFO_PLAC <- SUBJINFO |> 
+  filter(TX %in% "Placebo")
+
+# Join subject info with study partner info
+SUBJINFO_SPINFO <- left_join(SUBJINFO_PLAC, SPINFO_raw, by = "BID")
+
+# Note: some people have multiple study partners 
+# 591 obs -> 709 obs in joined dataframe 
+NUMSTUDYPARTNER <- 
+  SUBJINFO_SPINFO |> 
+  group_by(BID) |> 
+  summarise(
+    count = n()
+  ) |> 
+  arrange(desc(count))
+
+p <- NUMSTUDYPARTNER |> 
+  ggplot(aes(x = count)) +
+  geom_bar() +
+  labs(
+    title = "Number of Study Partners per Study Participant",
+    x = "Number of Study Partners",
+  ) +
+  theme_minimal()
+
+print(p)
+
+
+SUBJINFO_SPINFO <- 
+  SUBJINFO_SPINFO |> 
+  mutate(
+    INFRELAT = factor(case_when(
+      INFRELAT == 1 ~ "Spouse", 
+      INFRELAT == 2 ~ "Adult child", 
+      INFRELAT == 3 ~ "Child-in-law", 
+      INFRELAT == 4 ~ "Other relative", 
+      INFRELAT == 5 ~ "Friend/Companion", 
+      INFRELAT == 6 ~ "Paid caregiver (specify)", 
+      INFRELAT == 7 ~ "Other (specify)", 
+    )), 
+    INFGENDER = factor(case_when(
+      INFGENDER == 1 ~ "Male",
+      INFGENDER == 2 ~ "Female"), levels = c("Male", "Female")), 
+    INFLIVE = factor(case_when(
+      INFLIVE == 1 ~ "Yes",
+      INFLIVE == 0 ~ "No"), levels = c("Yes", "No")), 
+    INFAGE = factor(case_when(
+      INFAGE == 1 ~ "Yes",
+      INFAGE == 0 ~ "No"), levels = c("Yes", "No"))
+    )
+SUBJINFO_SPINFO|>
+  filter(BID == "B24086937")
+```
+
+``` {r}
+# Relable
+label(SUBJINFO_SPINFO$AGEYR) <- "Age (y)"
+label(SUBJINFO_SPINFO$SEX) <- "Sex"
+label(SUBJINFO_SPINFO$RACE) <- "Race"
+label(SUBJINFO_SPINFO$ETHNIC) <- "Ethnicity"
+label(SUBJINFO_SPINFO$EDCCNTU) <- "Education (y)"
+label(SUBJINFO_SPINFO$MARITAL) <- "Marital Status"
+label(SUBJINFO_SPINFO$WRKRET) <- "Retirement Status"
+label(SUBJINFO_SPINFO$INFRELAT) <- "Study Partner Relationship"
+label(SUBJINFO_SPINFO$INFGENDER) <- "Study Partner Gender"
+label(SUBJINFO_SPINFO$INFAGE) <- "Study Partner Age > 90"
+label(SUBJINFO_SPINFO$INFAGESP) <- "Study Partner Age (Specify)"
+label(SUBJINFO_SPINFO$INFLIVE) <- "Lives with Study Partner"
+label(SUBJINFO_SPINFO$INFHRS) <- "Study Partner Hours Together (In-Person)"
+label(SUBJINFO_SPINFO$INFHRSOT) <- "Study Partner Hours Together (Remote)"
+
+
+table1(~ AGEYR + SEX + RACE + ETHNIC + EDCCNTU + MARITAL + WRKRET + INFRELAT 
+       + INFGENDER + INFAGE + INFAGESP + INFLIVE + INFHRS + INFHRSOT| TX, 
+       data = SUBJINFO_SPINFO |> filter(MITTFL == 1),
+       overall = FALSE,
+       caption = "Table 1: Demographic Characteristics")
+```
+
+
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(lubridate)
+
+# Your existing code for loading and processing data
+SUBJINFO <- read_csv("data/SUBJINFO.csv")
+SPINFO_raw <- read_csv("data/spinfo.csv")
+
+# Since you're focusing on placebo group
+SUBJINFO_PLAC <- SUBJINFO |> 
+  filter(TX %in% "Placebo")
+
+# Now let's load the CDR data (or whichever dataset has visit timing)
+cdr_data <- read_csv("data/cdr.csv")
+
+# Placebo filter
+cdr_plac <- cdr_data |> 
+  filter(BID %in% SUBJINFO_PLAC$BID)
+
+# Create the partner change tracking dataset
+# joining visit timing w/BPID info
+partner_visits <- cdr_plac |> 
+  select(BID, BPID, CDADTC_DAYS_T0) |> 
+  filter(!is.na(BPID)) |>  # Ignore wtvr visits w/out partner info
+  filter(CDADTC_DAYS_T0 >= 0) |> 
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  ) |> 
+  filter(WEEK <= 250) |>
+  arrange(BID, CDADTC_DAYS_T0)  
+
+# Target week def
+target_weeks <- c(48, 108, 168, 208, 240)
+
+# Closest visit to each target week for partner change
+partner_closest_week <- partner_visits |>
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) |>
+  unnest(distance_to_target) |>
+  group_by(BID, WEEK, BPID, CDADTC_DAYS_T0) |>
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) |>
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup()
+
+# Indicator. creation for partner change
+partner_change_indicator <- partner_closest_week |>
+  arrange(BID, target_week) |>
+  group_by(BID) |>
+  mutate(
+    previous_BPID = lag(BPID),
+    partner_changed = case_when(
+      is.na(previous_BPID) ~ 0,  # First visit - no change
+      BPID != previous_BPID ~ 1,  # Partner changed
+      TRUE ~ 0  # Partner stayed the same
+    )
+  ) |>
+  ungroup()
+
+# wide format partner change indicator implementation
+wide_partner_indicator <- partner_change_indicator |>
+  select(BID, target_week, partner_changed) |>
+  pivot_wider(
+    names_from = target_week,
+    values_from = partner_changed,
+    names_prefix = "PARTNER_CHANGE_W",
+    values_fill = NA
+  )
+
+# Partner change Summary
+partner_change_summary <- partner_change_indicator |>
+  group_by(BID) |>
+  summarise(
+    total_partner_changes = sum(partner_changed, na.rm = TRUE),
+    visits_with_partner_data = n(),
+    unique_partners = n_distinct(BPID)
+  ) |>
+  arrange(desc(total_partner_changes))
+
+# Partner Change Visual
+partner_change_plot <- partner_change_indicator |>
+  group_by(target_week) |>
+  summarise(
+    total_changes = sum(partner_changed, na.rm = TRUE),
+    pct_changed = mean(partner_changed, na.rm = TRUE) * 100
+  ) |>
+  ggplot(aes(x = factor(target_week), y = pct_changed)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Percentage of Patients Who Changed Study Partners at Each Visit",
+    x = "Week",
+    y = "Percentage with Partner Change (%)"
+  ) +
+  theme_minimal()
+
+print(partner_change_plot)
+
+# Example: Look at patients with most partner changes
+high_change_patients <- partner_change_summary |>
+  filter(total_partner_changes >= 2)
+
+print(high_change_patients)
+
+# Join with your SPINFO data to see partner details for those who changed
+partner_details <- partner_change_indicator |>
+  filter(partner_changed == 1) |>
+  left_join(SPINFO_raw, by = c("BID", "BPID")) |>
+  select(BID, target_week, BPID, previous_BPID, INFRELAT, INFGENDER)
+
+# Create a more detailed view of partner transitions
+partner_transitions <- partner_change_indicator |>
+  filter(partner_changed == 1) |>
+  select(BID, target_week, previous_BPID, BPID) |>
+  left_join(
+    SPINFO_raw |> select(BID, BPID, INFRELAT) |> rename(prev_INFRELAT = INFRELAT),
+    by = c("BID", "previous_BPID" = "BPID")
+  ) |>
+  left_join(
+    SPINFO_raw |> select(BID, BPID, INFRELAT) |> rename(new_INFRELAT = INFRELAT),
+    by = c("BID", "BPID")
+  ) |>
+  mutate(
+    transition_type = paste0(
+      case_when(
+        prev_INFRELAT == 1 ~ "Spouse",
+        prev_INFRELAT == 2 ~ "Adult child",
+        prev_INFRELAT == 3 ~ "Child-in-law",
+        prev_INFRELAT == 4 ~ "Other relative",
+        prev_INFRELAT == 5 ~ "Friend/Companion",
+        prev_INFRELAT == 6 ~ "Paid caregiver",
+        prev_INFRELAT == 7 ~ "Other",
+        TRUE ~ "Unknown"
+      ),
+      " -> ",
+      case_when(
+        new_INFRELAT == 1 ~ "Spouse",
+        new_INFRELAT == 2 ~ "Adult child",
+        new_INFRELAT == 3 ~ "Child-in-law",
+        new_INFRELAT == 4 ~ "Other relative",
+        new_INFRELAT == 5 ~ "Friend/Companion",
+        new_INFRELAT == 6 ~ "Paid caregiver",
+        new_INFRELAT == 7 ~ "Other",
+        TRUE ~ "Unknown"
+      )
+    )
+  )
+
+# Summary of transition types
+transition_summary <- partner_transitions |>
+  count(transition_type) |>
+  arrange(desc(n))
+
+print(transition_summary)
+
+# Final wide format result
+wide_partner_indicator
+
+```
+```{r}
+# Additional visualizations for partner change effects on CDR outcomes
+# Add this code after your existing partner change analysis
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(viridis)
+
+# 1. CDR-SB trajectory by partner change status
+# First, categorize patients by partner change frequency
+partner_change_categories <- partner_change_summary |>
+  mutate(
+    change_category = case_when(
+      total_partner_changes == 0 ~ "No changes",
+      total_partner_changes == 1 ~ "1 change",
+      total_partner_changes == 2 ~ "2 changes",
+      total_partner_changes >= 3 ~ "3+ changes"
+    ),
+    change_category = factor(change_category, 
+                           levels = c("No changes", "1 change", "2 changes", "3+ changes"))
+  )
+
+# Get CDR-SB scores at key timepoints
+cdr_trajectory <- cdr_plac |>
+  filter(CDADTC_DAYS_T0 >= 0) |>
+  mutate(WEEK = CDADTC_DAYS_T0 / 7) |>
+  # Focus on similar timepoints as partner change analysis
+  filter(WEEK >= 0 & WEEK <= 250) |>
+  # Create week bins for aggregation
+  mutate(
+    week_bin = case_when(
+      WEEK <= 26 ~ "0-26 weeks",
+      WEEK <= 52 ~ "26-52 weeks",
+      WEEK <= 104 ~ "52-104 weeks",
+      WEEK <= 156 ~ "104-156 weeks",
+      WEEK <= 208 ~ "156-208 weeks",
+      TRUE ~ "208+ weeks"
+    ),
+    week_bin_numeric = case_when(
+      WEEK <= 26 ~ 13,
+      WEEK <= 52 ~ 39,
+      WEEK <= 104 ~ 78,
+      WEEK <= 156 ~ 130,
+      WEEK <= 208 ~ 182,
+      TRUE ~ 224
+    )
+  ) |>
+  left_join(partner_change_categories |> select(BID, change_category), by = "BID") |>
+  filter(!is.na(change_category) & !is.na(CDRSB))
+
+# Calculate mean CDR-SB by timepoint and change category
+cdr_summary <- cdr_trajectory |>
+  group_by(week_bin_numeric, change_category) |>
+  summarise(
+    mean_CDRSB = mean(CDRSB, na.rm = TRUE),
+    se_CDRSB = sd(CDRSB, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  )
+
+# Plot 1: CDR-SB trajectory by partner change category
+p1 <- ggplot(cdr_summary, aes(x = week_bin_numeric, y = mean_CDRSB, 
+                               color = change_category, group = change_category)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_CDRSB - se_CDRSB, 
+                    ymax = mean_CDRSB + se_CDRSB), 
+                width = 5, alpha = 0.6) +
+  scale_color_viridis_d(name = "Partner Changes") +
+  labs(
+    title = "CDR-Sum of Boxes Trajectory by Partner Change Frequency",
+    subtitle = "Higher partner changes associated with worse cognitive outcomes",
+    x = "Study Week",
+    y = "Mean CDR-SB Score"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12, color = "gray40")
+  ) +
+  scale_x_continuous(breaks = c(0, 52, 104, 156, 208))
+
+print(p1)
+
+# 2. Heatmap of partner changes and baseline characteristics
+# Get baseline CDR components
+baseline_cdr <- cdr_plac |>
+  filter(CDADTC_DAYS_T0 >= -30 & CDADTC_DAYS_T0 <= 30) |>  # Near baseline
+  group_by(BID) |>
+  slice_min(abs(CDADTC_DAYS_T0)) |>
+  ungroup() |>
+  select(BID, MEMORY, ORIENT, JUDGE, COMMUN, HOME, CARE, CDRSB) |>
+  left_join(partner_change_categories |> select(BID, total_partner_changes), by = "BID") |>
+  filter(!is.na(total_partner_changes))
+
+# Create correlation matrix
+cdr_components <- baseline_cdr |>
+  select(MEMORY, ORIENT, JUDGE, COMMUN, HOME, CARE, CDRSB, total_partner_changes) |>
+  cor(use = "complete.obs")
+
+# Convert to long format for plotting
+cdr_cor_df <- as.data.frame(cdr_components)
+cdr_cor_df$var1 <- rownames(cdr_cor_df)
+cdr_cor_long <- cdr_cor_df |>
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation")
+
+# Plot 2: Correlation heatmap
+p2 <- ggplot(cdr_cor_long, aes(x = var1, y = var2, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(correlation, 2)), size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limits = c(-1, 1),
+                       name = "Correlation") +
+  labs(
+    title = "Correlation Between Baseline CDR Components and Partner Changes",
+    subtitle = "Exploring relationships between cognitive domains and caregiver stability",
+    x = "", y = ""
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12, color = "gray40")
+  ) +
+  coord_fixed()
+
+print(p2)
+```
+```{r}
+# Simple CFI analysis for partner change effects
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Load CFI data
+cfi_data <- read_csv("data/cfi.csv")
+
+# Filter for placebo patients
+cfi_plac <- cfi_data |>
+  filter(BID %in% SUBJINFO_PLAC$BID)
+
+# Join with timing data from CDR
+cfi_with_timing <- cfi_plac |>
+  left_join(
+    cdr_plac |> select(BID, VISCODE, CDADTC_DAYS_T0),
+    by = c("BID", "VISCODE")
+  ) |>
+  filter(!is.na(CDADTC_DAYS_T0) & CDADTC_DAYS_T0 >= 0) |>
+  mutate(WEEK = CDADTC_DAYS_T0 / 7)
+
+# Create simple partner change groups
+partner_groups <- partner_change_summary |>
+  mutate(
+    group = case_when(
+      total_partner_changes == 0 ~ "No changes",
+      total_partner_changes == 1 ~ "1 change", 
+      TRUE ~ "2+ changes"
+    )
+  ) |>
+  select(BID, group)
+
+# Debug: Check partner groups
+cat("Partner groups summary:\n")
+print(table(partner_groups$group))
+
+# Join CFI with partner groups
+cfi_analysis <- cfi_with_timing |>
+  left_join(partner_groups, by = "BID") |>
+  filter(!is.na(group) & !is.na(CFIPTTOTAL))
+
+# Debug: Check joined data
+cat("\nCFI analysis rows:", nrow(cfi_analysis), "\n")
+cat("Groups in CFI analysis:\n")
+print(table(cfi_analysis$group))
+
+# Plot 1: CFI trajectory over time
+# Create time bins
+cfi_trajectory <- cfi_analysis |>
+  mutate(
+    time_period = case_when(
+      WEEK <= 26 ~ "0-6 months",
+      WEEK <= 52 ~ "6-12 months",
+      WEEK <= 104 ~ "1-2 years",
+      WEEK <= 156 ~ "2-3 years",
+      WEEK <= 208 ~ "3-4 years",
+      TRUE ~ "4+ years"
+    ),
+    time_numeric = case_when(
+      WEEK <= 26 ~ 13,
+      WEEK <= 52 ~ 39,
+      WEEK <= 104 ~ 78,
+      WEEK <= 156 ~ 130,
+      WEEK <= 208 ~ 182,
+      TRUE ~ 220
+    )
+  )
+
+# Calculate means
+cfi_means <- cfi_trajectory |>
+  group_by(time_numeric, group) |>
+  summarise(
+    mean_CFI = mean(CFIPTTOTAL, na.rm = TRUE),
+    se_CFI = sd(CFIPTTOTAL, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  )
+
+# Debug: Check means
+cat("\nCFI means rows:", nrow(cfi_means), "\n")
+
+# Plot 1
+if(nrow(cfi_means) > 0) {
+  p1 <- ggplot(cfi_means, aes(x = time_numeric, y = mean_CFI, color = group)) +
+    geom_line(size = 1.5) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = mean_CFI - se_CFI, ymax = mean_CFI + se_CFI), 
+                  width = 5, alpha = 0.7) +
+    scale_color_manual(values = c("No changes" = "#2E86AB", 
+                                  "1 change" = "#F77F00", 
+                                  "2+ changes" = "#D62828")) +
+    labs(
+      title = "Cognitive Function Index Over Time by Partner Change Status",
+      x = "Weeks from Baseline",
+      y = "Mean CFI Score (higher = worse)",
+      color = "Partner Changes"
+    ) +
+    scale_x_continuous(breaks = c(0, 52, 104, 156, 208),
+                       labels = c("0", "1 year", "2 years", "3 years", "4 years")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p1)
+} else {
+  cat("No data for Plot 1\n")
+}
+
+# Plot 2: Baseline CFI differences
+# Get baseline CFI scores
+baseline_cfi <- cfi_analysis |>
+  filter(WEEK <= 4) |>
+  group_by(BID) |>
+  slice(1) |>
+  ungroup()
+
+cat("\nBaseline CFI rows:", nrow(baseline_cfi), "\n")
+
+# Convert CFI items to numeric - check if they exist first
+cfi_items <- c("MEMORY", "REPEAT", "MISPLA", "WRITTN", "HELP", "RECALL", 
+               "DRIVE", "MONEY", "SOCIAL", "WORK", "FOLLOW", "ACTIV", 
+               "LOST", "APPLIA", "PTCONCERN")
+
+# Check which items exist
+existing_items <- cfi_items[cfi_items %in% names(baseline_cfi)]
+cat("Existing CFI items:", length(existing_items), "of", length(cfi_items), "\n")
+
+if(length(existing_items) > 0) {
+  # Convert to numeric
+  for(item in existing_items) {
+    baseline_cfi[[item]] <- as.numeric(baseline_cfi[[item]])
+  }
+  
+  # Calculate mean scores for each item by group
+  item_means <- baseline_cfi |>
+    select(group, all_of(existing_items)) |>
+    pivot_longer(cols = -group, names_to = "item", values_to = "score") |>
+    filter(!is.na(score)) |>
+    group_by(group, item) |>
+    summarise(
+      mean_score = mean(score, na.rm = TRUE),
+      n = n(),
+      .groups = 'drop'
+    ) |>
+    mutate(
+      item_label = case_when(
+        item == "MEMORY" ~ "Memory",
+        item == "REPEAT" ~ "Repeating",
+        item == "MISPLA" ~ "Misplacing",
+        item == "WRITTN" ~ "Writing",
+        item == "HELP" ~ "Need help",
+        item == "RECALL" ~ "Recall",
+        item == "DRIVE" ~ "Driving",
+        item == "MONEY" ~ "Money",
+        item == "SOCIAL" ~ "Social",
+        item == "WORK" ~ "Work",
+        item == "FOLLOW" ~ "Following",
+        item == "ACTIV" ~ "Activities",
+        item == "LOST" ~ "Getting lost",
+        item == "APPLIA" ~ "Appliances",
+        item == "PTCONCERN" ~ "Concerns",
+        TRUE ~ item
+      )
+    )
+  
+  # Debug
+  cat("\nItem means summary:\n")
+  print(table(item_means$group))
+  
+  # Calculate differences more simply
+  # Get data for each group
+  no_changes_means <- item_means |> 
+    filter(group == "No changes") |>
+    select(item, item_label, mean_score) |>
+    rename(score_no_change = mean_score)
+  
+  two_plus_means <- item_means |> 
+    filter(group == "2+ changes") |>
+    select(item, mean_score) |>
+    rename(score_two_plus = mean_score)
+  
+  # Join and calculate difference
+  if(nrow(no_changes_means) > 0 & nrow(two_plus_means) > 0) {
+    item_diff <- no_changes_means |>
+      inner_join(two_plus_means, by = "item") |>
+      mutate(difference = score_two_plus - score_no_change) |>
+      filter(!is.na(difference)) |>
+      arrange(desc(difference))
+    
+    cat("\nItem differences calculated:", nrow(item_diff), "items\n")
+    
+    # Plot 2
+    if(nrow(item_diff) > 0) {
+      p2 <- ggplot(item_diff, aes(x = difference, y = reorder(item_label, difference))) +
+        geom_segment(aes(x = 0, xend = difference, y = item_label, yend = item_label),
+                     color = "gray70", size = 1.5) +
+        geom_point(size = 4, color = "#D62828") +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+        labs(
+          title = "Baseline CFI Items: Difference Between 2+ Changes vs No Changes",
+          x = "Mean Difference in Score (positive = worse in 2+ changes group)",
+          y = ""
+        ) +
+        theme_minimal() +
+        theme(axis.text.y = element_text(size = 10))
+      
+      print(p2)
+      
+      # Print top differences
+      cat("\nTop 5 CFI items that differ most at baseline:\n")
+      print(head(item_diff |> select(item_label, score_no_change, score_two_plus, difference), 5))
+    }
+  } else {
+    cat("Not enough data for group comparisons\n")
+  }
+} else {
+  cat("No CFI items found in the data\n")
+}
+
+# Print summary
+cat("\n=== SUMMARY ===\n")
+cat("\nBaseline CFI by group:\n")
+if(nrow(baseline_cfi) > 0) {
+  baseline_summary <- baseline_cfi |>
+    group_by(group) |>
+    summarise(
+      n = n(),
+      mean_CFI = round(mean(CFIPTTOTAL, na.rm = TRUE), 2),
+      sd_CFI = round(sd(CFIPTTOTAL, na.rm = TRUE), 2)
+    )
+  print(baseline_summary)
+} else {
+  cat("No baseline data available\n")
+}
+```
+```{r}
+# CFI Score Variability Analysis Around Partner Changes
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Load CFI data
+cfi_data <- read_csv("data/cfi.csv")
+
+# Get placebo patients
+cfi_plac <- cfi_data |>
+  filter(BID %in% SUBJINFO_PLAC$BID)
+
+# Join with timing from CDR
+cfi_with_timing <- cfi_plac |>
+  inner_join(
+    cdr_plac |> 
+      select(BID, VISCODE, CDADTC_DAYS_T0) |>
+      filter(!is.na(CDADTC_DAYS_T0)),
+    by = c("BID", "VISCODE")
+  ) |>
+  filter(!is.na(CFIPTTOTAL) & CDADTC_DAYS_T0 >= 0) |>
+  mutate(WEEK = CDADTC_DAYS_T0 / 7)
+
+# Check what we have
+cat("CFI with timing rows:", nrow(cfi_with_timing), "\n")
+cat("Unique patients:", length(unique(cfi_with_timing$BID)), "\n\n")
+
+# Get partner change events with timing
+partner_changes <- partner_change_indicator |>
+  filter(partner_changed == 1) |>
+  select(BID, target_week) |>
+  rename(change_week = target_week)
+
+cat("Partner change events:", nrow(partner_changes), "\n\n")
+
+# For each patient, calculate CFI variability in windows around changes
+window_size <- 26
+
+# First, get patients with partner changes
+patients_with_changes <- unique(partner_changes$BID)
+cat("Patients with partner changes:", length(patients_with_changes), "\n\n")
+
+# Calculate variability for patients WITH partner changes
+variability_with_changes <- cfi_with_timing |>
+  filter(BID %in% patients_with_changes) |>
+  inner_join(partner_changes, by = "BID") |>
+  mutate(
+    weeks_from_change = WEEK - change_week,
+    period = case_when(
+      weeks_from_change >= -window_size & weeks_from_change < 0 ~ "Before",
+      weeks_from_change >= 0 & weeks_from_change <= window_size ~ "After",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(period))
+
+# Check the data
+cat("Observations around partner changes:", nrow(variability_with_changes), "\n")
+cat("Period distribution:\n")
+print(table(variability_with_changes$period))
+cat("\n")
+
+# Calculate variability by patient, change event, and period
+variability_summary <- variability_with_changes |>
+  group_by(BID, change_week, period) |>
+  summarise(
+    n_obs = n(),
+    mean_cfi = mean(CFIPTTOTAL),
+    sd_cfi = sd(CFIPTTOTAL),
+    .groups = 'drop'
+  ) |>
+  filter(n_obs >= 2)  # Need at least 2 observations for SD
+
+cat("Variability summaries:", nrow(variability_summary), "\n")
+
+# Check what periods we have
+cat("Unique periods in summary:\n")
+print(unique(variability_summary$period))
+cat("\n")
+
+# Now pivot - let's see what columns we get
+variability_wide <- variability_summary |>
+  select(BID, change_week, period, sd_cfi) |>
+  pivot_wider(names_from = period, values_from = sd_cfi)
+
+cat("Columns after pivot_wider:\n")
+print(names(variability_wide))
+cat("\n")
+
+# Now we can properly filter and calculate
+if("Before" %in% names(variability_wide) & "After" %in% names(variability_wide)) {
+  variability_comparison <- variability_wide |>
+    filter(!is.na(Before) & !is.na(After)) |>
+    mutate(
+      variability_change = After - Before,
+      increased_variability = variability_change > 0
+    )
+  
+  cat("Partner changes with before/after data:", nrow(variability_comparison), "\n\n")
+  
+  if(nrow(variability_comparison) > 0) {
+    # PLOT 1: Distribution of variability changes
+    p1 <- ggplot(variability_comparison, aes(x = variability_change)) +
+      geom_histogram(bins = 20, fill = "#E74C3C", alpha = 0.7, color = "white") +
+      geom_vline(xintercept = 0, linetype = "dashed", size = 1, color = "gray40") +
+      geom_vline(xintercept = mean(variability_comparison$variability_change), 
+                 linetype = "solid", size = 1, color = "#C0392B") +
+      labs(
+        title = "Change in CFI Score Variability Around Partner Changes",
+        subtitle = paste0("n=", nrow(variability_comparison), " partner change events with sufficient data"),
+        x = "Change in Standard Deviation (After - Before)",
+        y = "Count",
+        caption = paste0("Mean change: ", round(mean(variability_comparison$variability_change), 2),
+                         " | ", sum(variability_comparison$increased_variability), 
+                         " of ", nrow(variability_comparison), 
+                         " changes showed increased variability")
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        plot.caption = element_text(hjust = 0)
+      )
+    
+    print(p1)
+    
+    # Summary statistics
+    cat("Summary of variability changes:\n")
+    summary_stats <- variability_comparison |>
+      summarise(
+        n = n(),
+        mean_change = mean(variability_change),
+        median_change = median(variability_change),
+        pct_increased = mean(increased_variability) * 100
+      )
+    print(summary_stats)
+  }
+} else {
+  cat("Not enough data to compare before/after variability\n")
+}
+
+# PLOT 2: Simple comparison of CFI variability by group
+# Get all CFI observations with group info
+partner_groups <- partner_change_summary |>
+  mutate(
+    group = ifelse(total_partner_changes == 0, "Stable partner", "Partner changes")
+  ) |>
+  select(BID, group)
+
+cfi_by_group <- cfi_with_timing |>
+  inner_join(partner_groups, by = "BID")
+
+# Calculate variability for each patient
+patient_variability <- cfi_by_group |>
+  group_by(BID, group) |>
+  summarise(
+    n_obs = n(),
+    mean_cfi = mean(CFIPTTOTAL),
+    sd_cfi = sd(CFIPTTOTAL),
+    cv_cfi = sd_cfi / mean_cfi,  # Coefficient of variation
+    .groups = 'drop'
+  ) |>
+  filter(n_obs >= 3)  # Need multiple observations
+
+cat("\n\nPatients with variability data:", nrow(patient_variability), "\n")
+
+if(nrow(patient_variability) > 10) {
+  # Plot 2: Boxplot comparison
+  p2 <- ggplot(patient_variability, aes(x = group, y = sd_cfi, fill = group)) +
+    geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+    geom_jitter(width = 0.2, alpha = 0.2, size = 1) +
+    scale_fill_manual(values = c("Stable partner" = "#3498DB", 
+                                 "Partner changes" = "#E74C3C")) +
+    labs(
+      title = "CFI Score Variability by Partner Stability",
+      subtitle = "Standard deviation of each patient's CFI scores over time",
+      x = "",
+      y = "Standard Deviation of CFI Scores",
+      caption = paste0("Based on ", nrow(patient_variability), " patients with 3+ CFI measurements")
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold")
+    )
+  
+  print(p2)
+  
+  # Summary by group
+  cat("\nVariability summary by group:\n")
+  group_summary <- patient_variability |>
+    group_by(group) |>
+    summarise(
+      n = n(),
+      mean_sd = mean(sd_cfi, na.rm = TRUE),
+      median_sd = median(sd_cfi, na.rm = TRUE),
+      mean_cv = mean(cv_cfi, na.rm = TRUE)
+    )
+  print(group_summary)
+  
+  # Statistical test
+  if(length(unique(patient_variability$group)) == 2) {
+    cat("\nWilcoxon test for difference in variability:\n")
+    test_result <- wilcox.test(sd_cfi ~ group, data = patient_variability)
+    print(test_result)
+  }
+}
+```
+```{r}
+# CFI trajectory plot by partner change status
+library(ggplot2)
+library(dplyr)
+
+# Load CFI data
+cfi_data <- read_csv("data/cfi.csv")
+
+# Get placebo patients
+cfi_plac <- cfi_data |>
+  filter(BID %in% SUBJINFO_PLAC$BID)
+
+# Join with timing from CDR to get visit weeks
+cfi_with_timing <- cfi_plac |>
+  inner_join(
+    cdr_plac |> 
+      select(BID, VISCODE, CDADTC_DAYS_T0) |>
+      filter(!is.na(CDADTC_DAYS_T0)),
+    by = c("BID", "VISCODE")
+  ) |>
+  filter(!is.na(CFIPTTOTAL) & CDADTC_DAYS_T0 >= -14) |>
+  mutate(WEEK = CDADTC_DAYS_T0 / 7)
+
+# Create binary variable for whether patient ever had a partner change
+partner_change_binary <- partner_change_summary |>
+  mutate(
+    partner_changed_ever = ifelse(total_partner_changes > 0, "Partner changed", "No partner change")
+  ) |>
+  select(BID, partner_changed_ever)
+
+# Join CFI data with partner change status
+cfi_with_change_status <- cfi_with_timing |>
+  inner_join(partner_change_binary, by = "BID") |>
+  filter(WEEK >= 0 & WEEK <= 240)  # Reasonable time range
+
+# Calculate means over time
+cfi_means <- cfi_with_change_status |>
+  mutate(
+    # Create time bins (every 26 weeks / 6 months)
+    time_bin = floor(WEEK / 26) * 26
+  ) |>
+  group_by(time_bin, partner_changed_ever) |>
+  summarise(
+    mean_cfi = mean(CFIPTTOTAL, na.rm = TRUE),
+    se_cfi = sd(CFIPTTOTAL, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  ) |>
+  filter(n >= 10)  # Only show time points with sufficient data
+
+# Count patients in each group
+group_counts <- partner_change_binary |>
+  count(partner_changed_ever) |>
+  mutate(label = paste0(partner_changed_ever, "\n(n=", n, " patients)"))
+
+# Add labels to the means data
+cfi_means <- cfi_means |>
+  left_join(group_counts |> select(partner_changed_ever, label), by = "partner_changed_ever")
+
+# Create the plot
+p <- ggplot(cfi_means, aes(x = time_bin, y = mean_cfi, color = label, group = label)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 3) +
+  geom_ribbon(aes(ymin = mean_cfi - se_cfi, ymax = mean_cfi + se_cfi, fill = label), 
+              alpha = 0.2, color = NA) +
+  scale_color_manual(values = c("#3498DB", "#E74C3C")) +
+  scale_fill_manual(values = c("#3498DB", "#E74C3C")) +
+  labs(
+    title = "CFI Scores Over Time by Study Partner Change Status",
+    x = "Weeks from Baseline",
+    y = "Mean CFI Total Score",
+    color = "",
+    fill = "",
+    subtitle = "Higher scores indicate worse function as rated by study partners"
+  ) +
+  scale_x_continuous(breaks = seq(0, 240, 52), 
+                     labels = c("Baseline", "1 year", "2 years", "3 years", "4 years")) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray50", size = 11),
+    legend.text = element_text(size = 10)
+  )
+
+print(p)
+```
+```{r}
+# CFI trajectory plot by partner change status
+library(ggplot2)
+library(dplyr)
+
+# Load CFI data
+cfi_data <- read_csv("data/cfi.csv")
+
+# Get placebo patients
+cfi_plac <- cfi_data |>
+  filter(BID %in% SUBJINFO_PLAC$BID)
+
+# Join with timing from CDR to get visit weeks
+cfi_with_timing <- cfi_plac |>
+  inner_join(
+    cdr_plac |> 
+      select(BID, VISCODE, CDADTC_DAYS_T0) |>
+      filter(!is.na(CDADTC_DAYS_T0)),
+    by = c("BID", "VISCODE")
+  ) |>
+  filter(!is.na(CFIPTTOTAL) & CDADTC_DAYS_T0 >= -14) |>
+  mutate(WEEK = CDADTC_DAYS_T0 / 7)
+
+# Create binary variable for whether patient ever had a partner change
+partner_change_binary <- partner_change_summary |>
+  mutate(
+    partner_changed_ever = ifelse(total_partner_changes > 0, "Partner changed", "No partner change")
+  ) |>
+  select(BID, partner_changed_ever)
+
+# Join CFI data with partner change status
+cfi_with_change_status <- cfi_with_timing |>
+  inner_join(partner_change_binary, by = "BID") |>
+  filter(WEEK >= 0 & WEEK <= 240)  # Reasonable time range
+
+# Calculate means over time
+cfi_means <- cfi_with_change_status |>
+  mutate(
+    # Create time bins (every 26 weeks / 6 months)
+    time_bin = floor(WEEK / 26) * 26
+  ) |>
+  group_by(time_bin, partner_changed_ever) |>
+  summarise(
+    mean_cfi = mean(CFIPTTOTAL, na.rm = TRUE),
+    se_cfi = sd(CFIPTTOTAL, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = 'drop'
+  ) |>
+  filter(n >= 5)  # Lower threshold to show more time points
+
+# Debug: Check the data range for each group
+cat("Time range by group:\n")
+cfi_with_change_status |>
+  group_by(partner_changed_ever) |>
+  summarise(
+    min_week = min(WEEK),
+    max_week = max(WEEK),
+    n_patients = n_distinct(BID),
+    n_obs = n()
+  ) |>
+  print()
+
+cat("\nTime bins with data:\n")
+cfi_means |>
+  group_by(partner_changed_ever) |>
+  summarise(
+    time_bins = paste(sort(unique(time_bin)), collapse = ", "),
+    max_bin = max(time_bin)
+  ) |>
+  print()
+
+# Count patients in each group
+group_counts <- partner_change_binary |>
+  count(partner_changed_ever) |>
+  mutate(label = paste0(partner_changed_ever, "\n(n=", n, " patients)"))
+
+# Add labels to the means data
+cfi_means <- cfi_means |>
+  left_join(group_counts |> select(partner_changed_ever, label), by = "partner_changed_ever")
+
+# Create the plot
+p <- ggplot(cfi_means, aes(x = time_bin, y = mean_cfi, color = label, group = label)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 3) +
+  geom_ribbon(aes(ymin = mean_cfi - se_cfi, ymax = mean_cfi + se_cfi, fill = label), 
+              alpha = 0.2, color = NA) +
+  scale_color_manual(values = c("#3498DB", "#E74C3C")) +
+  scale_fill_manual(values = c("#3498DB", "#E74C3C")) +
+  labs(
+    title = "CFI Scores Over Time by Study Partner Change Status",
+    x = "Weeks from Baseline",
+    y = "Mean CFI Total Score",
+    color = "",
+    fill = "",
+    subtitle = "Higher scores indicate worse function as rated by study partners"
+  ) +
+  scale_x_continuous(breaks = seq(0, 240, 52), 
+                     labels = c("Baseline", "1 year", "2 years", "3 years", "4 years"),
+                     limits = c(0, 240)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray50", size = 11),
+    legend.text = element_text(size = 10)
+  )
+
+print(p)
+```
+
