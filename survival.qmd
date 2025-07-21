@@ -11,12 +11,7 @@ editor: visual
 -   Plot time to progression of CDR for CFI PT/SP/TOTAL quartiles
 -   Compare survival curves across quartiles for each CFI measure
 
-## Setup and Libraries
-
-```{r setup}
-#| message: false
-#| warning: false
-
+```{r load-libraries-and-read-data, message=FALSE, warning=FALSE}
 library(tidyverse)
 library(survival)
 library(survminer)
@@ -26,539 +21,83 @@ library(glue)
 library(kableExtra)
 library(broom)
 library(patchwork)
+
+base_path <- "/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/"
+derived_path <- "/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Derived Data/"
+
+CDR_raw <- read_csv(file.path(base_path, "cdr.csv"))
+ADQS_raw <- read_csv(file.path(derived_path, "ADQS.csv"))
+SUBJINFO_raw <- read_csv(file.path(derived_path, "SUBJINFO.csv"))
 ```
 
-## Read Data & Manipulation
-
-```{r data-read}
-#| message: false
-CDR_raw<-read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/cdr.csv")
-CFI_raw<-read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/cfi.csv")
-SPINFO_raw <- read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/spinfo.csv")
-SUBJINFO_raw <- read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Derived Data/SUBJINFO.csv")
-# Longitudinal PACC data from Analysis Data Questionnaire Scores (ADQS):
-ADQS_raw <- read_csv("/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData/Derived Data/ADQS.csv")
-```
-
-```{r data-manipulation}
-#| include: false
-
-# Outcomes collected at Visit 1
-V1OUTCOME <- ADQS_raw |>
-  filter(VISITCD == "001") %>%
-  select(BID, QSTESTCD, QSSTRESN) %>%
-  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
-
-# Outcomes collected at Visit 6
-V6OUTCOME <- ADQS_raw %>%
-  filter(VISITCD == "006") %>%
-  select(BID, QSTESTCD, QSSTRESN) %>%
-  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
-unique(V1OUTCOME)
-SUBJINFO <- SUBJINFO_raw %>%
-  left_join(V6OUTCOME, by = "BID") %>%
-  left_join(V1OUTCOME %>%
-      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
-    by = "BID") %>%
-  mutate(
-    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
-      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
-      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
-      AGEYR >= 85 ~ "Age >= 85"),
-    SEX = factor(case_when(
-      SEX == 1 ~ "Female",
-      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
-    RACE = case_when(RACE == 1 ~ "White",
-      RACE == 2 ~ "Black or African American",
-      RACE == 58 ~ "Asian",
-      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
-      RACE == 84 ~ "American Indian or Alaskan Native",
-      RACE == 97 ~ "Unknown or Not Reported",
-      RACE == 100 ~ "More than one race"),
-    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
-      MARITAL == 4 ~ "Never married",
-      MARITAL == 5 ~ "Widowed",
-      MARITAL == 11 ~ "Married",
-      MARITAL == 97 ~ "Unknown or Not Reported"),
-    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
-      ETHNIC == 56 ~ "Not Hispanic or Latino",
-      ETHNIC == 97 ~ "Unknown or Not reported"),
-    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
-      ALCHLBL == 1 ~ "Yes"),
-    CFBL = case_when(CFBL == 0 ~ "No",
-      CFBL == 1 ~ "Yes"),
-    TBBL = case_when(TBBL == 0 ~ "No",
-      TBBL == 1 ~ "Yes"),
-    WRKRET = case_when(WRKRET == 1 ~ "Yes",
-      WRKRET == 0 ~ "No",
-      WRKRET == 96 ~ "Not Applicable"),
-    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
-      APOEGNPRSNFLG == 0 ~ "No"),
-    AGEYR = as.numeric(AGEYR),
-    SUVRCER = as.numeric(SUVRCER),
-    AMYLCENT = as.numeric(AMYLCENT),
-    EDCCNTU = as.numeric(EDCCNTU),
-    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
-    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
-    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
-    COMPLETER_label = case_when(
-      SUBJCOMPTR == 1 ~ "Completer",
-      TRUE ~ "Dropout"))
-
-# Filter for placebo group
-SUBJINFO_PLAC <- SUBJINFO %>% 
-  filter(TX %in% "Placebo")
-```
-
-## CDR Progression Data Preparation
-
-```{r cdr-prep}
-# Get placebo group BIDs
-placebo_bids <- SUBJINFO_PLAC$BID
-
-# Prep raw CDR file for use
-CDR_ind <- CDR_raw %>% 
-  select(c("BID", "CDGLOBAL", "CDADTC_DAYS_T0")) %>% 
-  filter(BID %in% placebo_bids) %>%
-  filter(CDADTC_DAYS_T0 >= 0) %>% 
-  mutate(WEEK = CDADTC_DAYS_T0 / 7) %>% 
-  filter(WEEK <= 250)
-
-# Define target weeks
-target_weeks <- c(48, 108, 168, 208, 240)
-
-# Find closest visits to target weeks
-CDR_closest_week <- CDR_ind %>%
-  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) %>%
-  unnest(distance_to_target) %>%
-  group_by(BID, WEEK, CDGLOBAL) %>%
-  mutate(target_week = target_weeks[which.min(distance_to_target)]) %>%
-  group_by(BID, target_week) %>%
-  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) %>%
-  ungroup()
-
-# Find conversion times (first time CDGLOBAL > 0)
-conversion_times <- CDR_closest_week %>%
-  filter(CDGLOBAL > 0) %>%
-  group_by(BID) %>%
-  summarise(CDRCONV_WEEK = min(WEEK))
-```
-
-## Explore CFI Distributions
-
-```{r explore-cfi}
-# Check distributions of CFI variables
-
-cfi_summary <- SUBJINFO_PLAC %>%
-  select(CFITOTAL, CFISP, CFIPT) %>%
-  summarise(
-    across(everything(), list(
-      min = ~min(.x, na.rm = TRUE),
-      q25 = ~quantile(.x, 0.25, na.rm = TRUE),
-      median = ~median(.x, na.rm = TRUE),
-      q75 = ~quantile(.x, 0.75, na.rm = TRUE),
-      max = ~max(.x, na.rm = TRUE),
-      n_unique = ~n_distinct(.x, na.rm = TRUE)
-    ))
-  )
-
-cfi_summary
-
-# Check for ties at quartile boundaries
- SUBJINFO_PLAC |>
-  select(CFITOTAL, CFISP, CFIPT) |>
-  summarise(
-    across(everything(), list(
-      q25 = ~quantile(.x, 0.25, na.rm = TRUE),
-      q50 = ~quantile(.x, 0.50, na.rm = TRUE),
-      q75 = ~quantile(.x, 0.75, na.rm = TRUE)
-    ))
-  ) |>
-  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
-  separate(variable, into = c("cfi_type", "quartile"), sep = "_") |>
-  pivot_wider(names_from = quartile, values_from = value) |>
-  print()
-```
-
-## Create Survival Dataset with CFI Quartiles
-
-```{r survival-data}
-# Create survival dataset combining CDR conversion times with baseline CFI scores
-survival_data <- SUBJINFO_PLAC %>%
-  select(BID) %>%
-  left_join(V1OUTCOME %>%
-              select(BID, MMSE, ADLTOTAL, LMIIa, PACC, DIGIT, CFITOTAL, CFISP, CFIPT), 
-            by = "BID") %>%
-  left_join(conversion_times, by = "BID") %>%
-  mutate(
-    event = ifelse(is.na(CDRCONV_WEEK), 0, 1),
-    time_to_event = ifelse(is.na(CDRCONV_WEEK), 240, CDRCONV_WEEK)
-  ) %>%
-  # Remove those with missing data in any test variable
-  filter(if_all(c(MMSE, ADLTOTAL, LMIIa, PACC, DIGIT, CFITOTAL), ~ !is.na(.x)))|>
-  mutate(
-    # Use ntile() for more robust quartile creation
-    CFITOTAL_quartile = factor(ntile(CFITOTAL, 4), 
-                              labels = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)")),
-    
-    CFISP_quartile = factor(ntile(CFISP, 4), 
-                           labels = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)")),
-    
-    CFIPT_quartile = factor(ntile(CFIPT, 4), 
-                           labels = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"))
-  )
-
-# Summary of survival data
-cat("Survival Data Summary:\n")
-cat("Total subjects:", nrow(survival_data), "\n")
-cat("Events (CDR progression):", sum(survival_data$event), "\n")
-cat("Censored:", sum(1 - survival_data$event), "\n\n")
-
-# Check quartile distributions
-cat("Quartile Distributions:\n")
-survival_data %>%
-  select(ends_with("_quartile")) %>%
-  summary() %>%
-  print()
-```
-
-## Survival Analysis Results
-
-### CFI Total Score Quartiles
-
-```{r km-cfitotal}
-#| fig-height: 10
-#| fig-width: 12
-
-# Fit survival model for CFI Total
-km_cfitotal <- survfit(Surv(time_to_event, event) ~ CFITOTAL_quartile, data = survival_data)
-
-# Create plot using ggsurvplot
-p_cfitotal <- ggsurvplot(
-  km_cfitotal,
-  data = survival_data,
-  title = "Time to CDR Progression by CFI Total Score Quartiles",
-  xlab = "Time (weeks)",
-  ylab = "Progression-Free Survival",
-  xlim = c(0, 240),
-  break.time.by = 48,
-  risk.table = TRUE,
-  risk.table.title = "Number at risk",
-  risk.table.height = 0.3,
-  risk.table.fontsize = 3.5,
-  ncensor.plot = FALSE,
-  conf.int = TRUE,
-  conf.int.alpha = 0.1,
-  pval = TRUE,
-  pval.size = 4,
-  legend.title = "CFI Total Quartiles",
-  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
-  palette = c("#2E8B57", "#4682B4", "#DAA520", "#DC143C"),
-  ggtheme = theme_minimal() +
-    theme(
-      plot.title = element_text(size = 14, hjust = 0.5),
-      legend.position = "top"
-    )
-)
-
-print(p_cfitotal)
-
-# Print survival summary
-cat("\nCFI Total - Survival Summary:\n")
-print(summary(km_cfitotal, times = c(48, 108, 168, 208, 240)))
-```
-
-### CFI Study Partner Quartiles
-
-```{r km-cfisp}
-#| fig-height: 10
-#| fig-width: 12
-
-# Fit survival model for CFI Study Partner
-km_cfisp <- survfit(Surv(time_to_event, event) ~ CFISP_quartile, data = survival_data)
-
-# Create plot using ggsurvplot
-p_cfisp <- ggsurvplot(
-  km_cfisp,
-  data = survival_data,
-  title = "Time to CDR Progression by CFI Study Partner Quartiles",
-  xlab = "Time (weeks)",
-  ylab = "Progression-Free Survival",
-  xlim = c(0, 240),
-  break.time.by = 48,
-  risk.table = TRUE,
-  risk.table.title = "Number at risk",
-  risk.table.height = 0.3,
-  risk.table.fontsize = 3.5,
-  ncensor.plot = FALSE,
-  conf.int = TRUE,
-  conf.int.alpha = 0.1,
-  pval = TRUE,
-  pval.size = 4,
-  legend.title = "CFI Study Partner Quartiles",
-  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
-  palette = c("#2E8B57", "#4682B4", "#DAA520", "#DC143C"),
-  ggtheme = theme_minimal() +
-    theme(
-      plot.title = element_text(size = 14, hjust = 0.5),
-      legend.position = "top"
-    )
-)
-
-print(p_cfisp)
-
-# Print survival summary
-cat("\nCFI Study Partner - Survival Summary:\n")
-print(summary(km_cfisp, times = c(48, 108, 168, 208, 240)))
-```
-
-### CFI Patient Quartiles
-
-```{r km-cfipt}
-#| fig-height: 10
-#| fig-width: 12
-
-# Fit survival model for CFI Patient
-km_cfipt <- survfit(Surv(time_to_event, event) ~ CFIPT_quartile, data = survival_data)
-
-# Create plot using ggsurvplot
-p_cfipt <- ggsurvplot(
-  km_cfipt,
-  data = survival_data,
-  title = "Time to CDR Progression by CFI Patient Quartiles",
-  xlab = "Time (weeks)",
-  ylab = "Progression-Free Survival",
-  xlim = c(0, 240),
-  break.time.by = 48,
-  risk.table = TRUE,
-  risk.table.title = "Number at risk",
-  risk.table.height = 0.3,
-  risk.table.fontsize = 3.5,
-  ncensor.plot = FALSE,
-  conf.int = TRUE,
-  conf.int.alpha = 0.1,
-  pval = TRUE,
-  pval.size = 4,
-  legend.title = "CFI Patient Quartiles",
-  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
-  palette = c("#2E8B57", "#4682B4", "#DAA520", "#DC143C"),
-  ggtheme = theme_minimal() +
-    theme(
-      plot.title = element_text(size = 14, hjust = 0.5),
-      legend.position = "top"
-    )
-)
-
-print(p_cfipt)
-
-# Print survival summary
-cat("\nCFI Patient - Survival Summary:\n")
-print(summary(km_cfipt, times = c(48, 108, 168, 208, 240)))
-```
-
-## Statistical Tests
-
-```{r statistical-tests}
-# Log-rank tests for differences between quartiles
-cat("Log-rank Test Results:\n\n")
-
-cat("CFI Total Quartiles:\n")
-logrank_cfitotal <- survdiff(Surv(time_to_event, event) ~ CFITOTAL_quartile, data = survival_data)
-print(logrank_cfitotal)
-
-cat("\nCFI Study Partner Quartiles:\n")
-logrank_cfisp <- survdiff(Surv(time_to_event, event) ~ CFISP_quartile, data = survival_data)
-print(logrank_cfisp)
-
-cat("\nCFI Patient Quartiles:\n")
-logrank_cfipt <- survdiff(Surv(time_to_event, event) ~ CFIPT_quartile, data = survival_data)
-print(logrank_cfipt)
-```
-
-## Summary Statistics by Quartiles
-
-```{r summary-stats}
-# Create summary table
-summary_table <- survival_data %>%
-  pivot_longer(
-    cols = c(CFITOTAL_quartile, CFISP_quartile, CFIPT_quartile),
-    names_to = "CFI_type",
-    values_to = "quartile"
-  ) %>%
-  mutate(
-    CFI_type = case_when(
-      CFI_type == "CFITOTAL_quartile" ~ "CFI Total",
-      CFI_type == "CFISP_quartile" ~ "CFI Study Partner", 
-      CFI_type == "CFIPT_quartile" ~ "CFI Patient"
-    )
-  ) %>%
-  group_by(CFI_type, quartile) %>%
-  summarise(
-    N = n(),
-    Events = sum(event),
-    `Event Rate (%)` = round(100 * sum(event) / n(), 1),
-    `Median Time to Event` = ifelse(sum(event) > 0, 
-                                   median(time_to_event[event == 1]), 
-                                   NA),
-    .groups = "drop"
-  )
-
-print(summary_table)
-```
-
-## Key Findings
-
-The survival analysis reveals the relationship between baseline CFI scores and time to CDR progression:
-
--   **Higher CFI scores** (worse cognitive function) are associated with **faster progression** to CDR \> 0
--   **Q4 (worst function)** consistently shows the highest risk of progression
--   **Q1 (best function)** shows the lowest risk of progression
--   The **log-rank tests** indicate whether there are statistically significant differences between quartiles
-
-This analysis helps identify patients at higher risk for cognitive decline based on their baseline functional assessments. km_total \<- survfit(Surv(time_to_event, event) \~ CFITOTAL_quartile, data = survival_data) km_sp \<- survfit(Surv(time_to_event, event) \~ CFISP_quartile, data = survival_data) km_pt \<- survfit(Surv(time_to_event, event) \~ CFIPT_quartile, data = survival_data)
-
-```{r fig.width=10, fig.height=10}
-p_total_cuminc <- ggsurvplot(
-  km_cfitotal,
-  data = survival_data,
-  fun = "event",
-  title = "Cumulative Incidence of CDR Progression\nby CFI Tests Score Quartile",
-  xlab = "",
-  ylab = "Cumulative Incidence",
-  xlim = c(0, 240),
-  break.time.by = 48,
-  risk.table = FALSE,
-  conf.int = TRUE,
-  conf.int.alpha = 0.1,
-  pval = FALSE,
-  legend.title = "CFI Total Quartiles",
-  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
-  palette = c('#8c0003', '#474476', '#3d5073', '#375b6c'),
-  ggtheme = theme_minimal() + theme(
-    plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
-    axis.title = element_text(size = 20, face = "bold"),
-    axis.text = element_text(size = 18, face = "bold"),
-    legend.title = element_text(size = 18, face = "bold"),
-    legend.text = element_text(size = 16, face = "bold"),
-    legend.position = "top"
-  )
-)
-
-p_sp_cuminc <- ggsurvplot(
-  km_cfisp,
-  data = survival_data,
-  fun = "event",
-  title = "",
-  xlab = "",
-  ylab = "Cumulative Incidence",
-  xlim = c(0, 240),
-  break.time.by = 48,
-  risk.table = FALSE,
-  conf.int = TRUE,
-  conf.int.alpha = 0.1,
-  pval = FALSE,
-  legend.title = "CFI Study Partner Quartiles",
-  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
-  palette = c('#8c0003', '#474476', '#3d5073', '#375b6c'),
-  ggtheme = theme_minimal() + theme(
-    plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
-    axis.title = element_text(size = 20, face = "bold"),
-    axis.text = element_text(size = 18, face = "bold"),
-    legend.title = element_text(size = 18, face = "bold"),
-    legend.text = element_text(size = 16, face = "bold"),
-    legend.position = "top"
-  )
-)
-
-p_pt_cuminc <- ggsurvplot(
-  km_cfipt,
-  data = survival_data,
-  fun = "event",
-  title = "",
-  xlab = "Time (weeks)",
-  ylab = "Cumulative Incidence",
-  xlim = c(0, 240),
-  break.time.by = 48,
-  risk.table = FALSE,
-  conf.int = TRUE,
-  conf.int.alpha = 0.1,
-  pval = FALSE,
-  legend.title = "CFI Patient Quartiles",
-  legend.labs = c("Q1 (Best)", "Q2", "Q3", "Q4 (Worst)"),
-  palette = c('#8c0003', '#474476', '#3d5073', '#375b6c'),
-  ggtheme = theme_minimal() + theme(
-    plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
-    axis.title = element_text(size = 20, face = "bold"),
-    axis.text = element_text(size = 18, face = "bold"),
-    legend.title = element_text(size = 18, face = "bold"),
-    legend.text = element_text(size = 16, face = "bold"),
-    legend.position = "top"
-  )
-)
-
-png("cumulative_incidence_stacked_large_text.png", width = 1100, height = 1500)
-grid.arrange(p_total_cuminc$plot, p_sp_cuminc$plot, p_pt_cuminc$plot, ncol = 1)
-dev.off()
-
-```
-
-```{r fig.width=50, fig.height=50}
-test_vars <- c("MMSE", "ADLTOTAL", "LMIIa", "PACC", "DIGIT", "CFITOTAL", "CFISP", "CFIPT", "ADLPQPT", "ADLPQSP")
+```{r prepare-outcomes}
+test_vars <- c("MMSE", "ADLTOTAL", "LMIIa", "PACC", "DIGIT",
+               "CFITOTAL", "CFISP", "CFIPT", "ADLPQPT", "ADLPQSP")
 
 V1OUTCOME <- ADQS_raw |>
-  filter(VISITCD == "001", QSTESTCD %in% test_vars) |>
+  filter(VISITCD == "001") |>
   select(BID, QSTESTCD, QSSTRESN) |>
   pivot_wider(names_from = QSTESTCD, values_from = QSSTRESN)
 
-conversion_times <- CDR_closest_week |>
+V6OUTCOME <- ADQS_raw |>
+  filter(VISITCD == "006") |>
+  select(BID, QSTESTCD, QSSTRESN) |>
+  pivot_wider(names_from = QSTESTCD, values_from = QSSTRESN)
+```
+
+```{r prepare-subject-info}
+SUBJINFO <- SUBJINFO_raw |>
+  left_join(V1OUTCOME |> select(BID, all_of(test_vars), CDRSB), by = "BID") |>
+  left_join(V6OUTCOME, by = "BID") |>
+  mutate(
+    AGECAT = case_when(
+      AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"
+    ),
+    SEX = factor(case_when(SEX == 1 ~ "Female", SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = if_else(SUBJCOMPTR == 1, "Completer", "Dropout")
+  )
+
+SUBJINFO_PLAC <- SUBJINFO |> filter(TX == "Placebo")
+```
+
+```{r prepare-cdr-conversion}
+CDR_ind <- CDR_raw |>
+  filter(BID %in% SUBJINFO_PLAC$BID, CDADTC_DAYS_T0 >= 0) |>
+  mutate(WEEK = CDADTC_DAYS_T0 / 7) |>
+  filter(WEEK <= 250) |>
+  select(BID, CDGLOBAL, WEEK)
+
+conversion_times <- CDR_ind |>
   filter(CDGLOBAL > 0) |>
   group_by(BID) |>
   summarise(CDRCONV_WEEK = min(WEEK), .groups = "drop")
+```
 
+```{r create-survival-data}
 survival_data <- SUBJINFO_PLAC |>
   select(BID) |>
-  left_join(V1OUTCOME, by = "BID") |>
+  left_join(V1OUTCOME |> select(BID, all_of(test_vars)), by = "BID") |>
   left_join(conversion_times, by = "BID") |>
-  mutate(
-    event = if_else(is.na(CDRCONV_WEEK), 0L, 1L),
-    time_to_event = if_else(is.na(CDRCONV_WEEK), 240, CDRCONV_WEEK)
+  mutate(event = if_else(is.na(CDRCONV_WEEK), 0L, 1L),
+         time_to_event = if_else(is.na(CDRCONV_WEEK), 240, CDRCONV_WEEK))
+```
+
+```{r reshape-and-assign-quartiles}
+survival_long <- survival_data |>
+  pivot_longer(
+    cols = all_of(test_vars),
+    names_to = "Test",
+    values_to = "Score"
   ) |>
-  filter(if_all(all_of(test_vars), ~ !is.na(.x)))
+  filter(!is.na(Score)) |>
+  group_by(Test) |>
+  mutate(score_group = ntile(Score, 4) |> factor(levels = 1:4, labels = c("Q1", "Q2", "Q3", "Q4"))) |>
+  ungroup()
 
-quartile_palette <- c("Q1" = '#F21B3F',"Q2" = '#5762D5', "Q3" ='#d6ca98', "Q4" = '#4A5043')
-
-cox_results_list <- list()
-plot_list <- list()
-
-for (test_var in test_vars) {
-  temp_data <- survival_data |>
-    mutate(score_group = ntile(.data[[test_var]], 4)) |>
-    mutate(score_group = factor(score_group, levels = 1:4, labels = paste0("Q", 1:4)))
-
-  cox_model <- coxph(Surv(time_to_event, event) ~ score_group, data = temp_data)
-
-  cox_tidy <- broom::tidy(cox_model, exponentiate = TRUE, conf.int = TRUE) |>
-    filter(term != "(Intercept)") |>
-    mutate(
-      Test = test_var,
-      Quartile = str_extract(term, "score_groupQ\\d") |> str_replace("score_group", "")
-    ) |>
-    select(Test, Quartile, HR = estimate, LowerCI = conf.low, UpperCI = conf.high, p_value = p.value)
-
-  cox_results_list[[test_var]] <- cox_tidy
-
-  surv_obj <- survfit(Surv(time_to_event, event) ~ score_group, data = temp_data)
-  strata_levels <- gsub("score_group=", "", names(surv_obj$strata))
-  surv_df <- data.frame(
-    time = surv_obj$time,
-    estimate = surv_obj$surv,
-    strata = rep(strata_levels, surv_obj$strata),
-    Test = test_var
-  )
-  plot_list[[test_var]] <- surv_df
-}
-
-all_surv_df <- bind_rows(plot_list)
 
 facet_labels <- c(
   MMSE = "Mini Mental State Exam",
@@ -573,26 +112,110 @@ facet_labels <- c(
   ADLPQSP = "ADL Partner"
 )
 
-all_surv_df$Test <- recode(all_surv_df$Test, !!!facet_labels)
-all_surv_df$score_group <- all_surv_df$strata
+survival_long$Test <- recode(survival_long$Test, !!!facet_labels)
 
-km_facet_plot <- ggplot(all_surv_df, aes(x = time, y = estimate, color = score_group)) +
+cfi_tests <- c("CFI Participant and Partner", "CFI Partner", "CFI Participant")
+```
+
+```{r survival-analysis-and-plots}
+cox_results_list <- list()
+plot_data_list <- list()
+logrank_results_list <- list()
+
+for (test_name in unique(survival_long$Test)) {
+  temp_data <- survival_long |> filter(Test == test_name)
+
+  cox_model <- coxph(Surv(time_to_event, event) ~ score_group, data = temp_data)
+  cox_tidy <- broom::tidy(cox_model, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(
+      Test = test_name,
+      Quartile = str_replace(term, "score_group", "")
+    ) |>
+    select(Test, Quartile, HR = estimate, LowerCI = conf.low, UpperCI = conf.high, p_value = p.value)
+  cox_results_list[[test_name]] <- cox_tidy
+
+  logrank_test <- survdiff(Surv(time_to_event, event) ~ score_group, data = temp_data)
+  logrank_results_list[[test_name]] <- logrank_test
+
+  surv_obj <- survfit(Surv(time_to_event, event) ~ score_group, data = temp_data)
+  surv_df <- broom::tidy(surv_obj) |>
+    mutate(Test = test_name) |>
+    mutate(strata_group = str_extract(strata, "Q\\d"))
+  plot_data_list[[test_name]] <- surv_df
+}
+
+all_surv_plot_df <- bind_rows(plot_data_list) |>
+  mutate(Test = factor(Test, levels = unique(survival_long$Test)))
+
+base_quartile_colors <- c(
+  "Q1" = "#F21B3F",
+  "Q2" = "#5762D5",
+  "Q3" = "#d6ca98",
+  "Q4" = "#4A5043"
+)
+
+cfi_colors_swapped <- c(
+  "Q1" = "#4A5043",
+  "Q2" = "#5762D5",
+  "Q3" = "#d6ca98",
+  "Q4" = "#F21B3F"
+)
+
+non_cfi_plot_df <- all_surv_plot_df |>
+  filter(!Test %in% cfi_tests)
+
+km_non_cfi_plot <- ggplot(non_cfi_plot_df, aes(x = time, y = estimate, color = strata_group, group = interaction(Test, strata_group))) +
   geom_step(size = 0.8) +
-  facet_wrap(~Test, scales = "free_y") +
-  scale_color_manual(values = quartile_palette, name = "Quartile") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  facet_wrap(~Test, scales = "free_y", ncol = 2) +
+  coord_cartesian(ylim = c(0.3, 1)) +
+  scale_color_manual(values = base_quartile_colors, name = "Quartile") +
   labs(x = "Time (weeks)", y = "Survival Probability",
-       title = "Kaplan-Meier Curves by Quartile by Cognitive Test") +
-  theme_minimal(base_size = 14) +
+       title = "Kaplan-Meier Curves by Quartile by Cognitive Test (Excluding CFI)") +
+  theme_minimal(base_size = 18) +
   theme(
-    plot.title = element_text(size = 18, face = "bold"),
+    plot.title = element_text(size = 22, face = "bold"),
     axis.title = element_text(size = 16, face = "bold"),
-    axis.text = element_text(size = 14, face = "bold"),
-    strip.text = element_text(size = 14, face = "bold"),
-    legend.title = element_text(size = 14, face = "bold"),
-    legend.text = element_text(size = 12)
+    axis.text = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 16, face = "bold"),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16),
+    legend.position = "top"
   )
-ggsave("km_faceted_plot.png", km_facet_plot, width = 20, height = 10, dpi = 300)
 
+ggsave("km_non_cfi_faceted_plot.png", km_non_cfi_plot, width = 18, height = 18, dpi = 300)
+print(km_non_cfi_plot)
+
+cfi_plot_df <- all_surv_plot_df |>
+  filter(Test %in% cfi_tests)
+
+km_cfi_faceted_plot <- ggplot(cfi_plot_df, aes(x = time, y = estimate, color = strata_group, group = interaction(Test, strata_group))) +
+  geom_step(size = 0.8) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  facet_wrap(~Test, scales = "free_y", ncol = 1) +
+  coord_cartesian(ylim = c(0.3, 1)) +
+  scale_color_manual(values = cfi_colors_swapped, name = "Quartile") +
+  labs(x = "Time (weeks)", y = "Survival Probability",
+       title = "Kaplan-Meier Curves by Quartile for CFI Tests",
+       caption = "Note: Increasing CFI scores indicate decreasing cognitive function.") +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title = element_text(size = 26, face = "bold"),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 16, face = "bold"),
+    strip.text = element_text(size = 16, face = "bold"),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 16),
+    legend.position = "top",
+    plot.caption = element_text(size = 14, hjust = 0.5, face = "italic", margin = margin(t = 10))
+  )
+
+ggsave("km_cfi_faceted_plot.png", km_cfi_faceted_plot, width = 10, height = 12, dpi = 300)
+print(km_cfi_faceted_plot)
+```
+
+```{r hazard-ratios-table}
 cox_summary_table <- bind_rows(cox_results_list) |>
   filter(Quartile != "Q1") |>
   mutate(
@@ -600,25 +223,69 @@ cox_summary_table <- bind_rows(cox_results_list) |>
     CI = if_else(is.na(LowerCI), "", glue::glue("{round(LowerCI, 2)}–{round(UpperCI, 2)}")),
     p_value = if_else(is.na(p_value), "", as.character(signif(p_value, 3)))
   ) |>
-  select(Test, Quartile, HR, CI, p_value) |>
-  mutate(Test = recode(Test, !!!facet_labels))
+  select(Test, Quartile, HR, CI, p_value)
 
-background_colors <- case_when(
-  cox_summary_table$Quartile == "Q2" ~ "#5762D5",
-  cox_summary_table$Quartile == "Q3" ~ "#d6ca98",
-  cox_summary_table$Quartile == "Q4" ~ "#4A5043",
+background_colors_table <- case_when(
+  cox_summary_table$Test %in% cfi_tests & cox_summary_table$Quartile == "Q2" ~ cfi_colors_swapped["Q2"],
+  cox_summary_table$Test %in% cfi_tests & cox_summary_table$Quartile == "Q3" ~ cfi_colors_swapped["Q3"],
+  cox_summary_table$Test %in% cfi_tests & cox_summary_table$Quartile == "Q4" ~ cfi_colors_swapped["Q4"],
+  cox_summary_table$Quartile == "Q2" ~ base_quartile_colors["Q2"],
+  cox_summary_table$Quartile == "Q3" ~ base_quartile_colors["Q3"],
+  cox_summary_table$Quartile == "Q4" ~ base_quartile_colors["Q4"],
   TRUE ~ ""
 )
 
-kbl_out <- kbl(cox_summary_table, caption = "Hazard Ratios for CDR Progression by Quartile") |>
+kbl_out <- kbl(cox_summary_table, caption = "Hazard Ratios for CDR Progression by Quartile (Q1 as Reference)") |>
   kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed")) |>
-  column_spec(2, bold = TRUE, background = background_colors)
+  column_spec(2, bold = TRUE, background = background_colors_table)
 
-
-table_grob <- tableGrob(cox_summary_table, rows = NULL)
+print(kbl_out)
 
 png("cox_summary_table.png", width = 1000, height = 1500, res = 150)
-grid::grid.draw(table_grob)
+grid::grid.draw(gridExtra::tableGrob(cox_summary_table, rows = NULL))
 dev.off()
+```
 
+```{r summary-statistics}
+summary_table_quartiles <- survival_long |>
+  group_by(Test, score_group) |>
+  summarise(
+    N = n(),
+    Events = sum(event),
+    `Event Rate (%)` = round(100 * sum(event) / n(), 1),
+    `Median Time to Event` = ifelse(sum(event) > 0,
+                                    median(time_to_event[event == 1]),
+                                    NA),
+    .groups = "drop"
+  )
+print(summary_table_quartiles)
+```
+
+```{r logrank-tests}
+cat("\n--- Log-rank Test Results for Differences Between Quartiles ---\n\n")
+for (test_name in names(logrank_results_list)) {
+  cat(glue("{test_name} Quartiles:\n"))
+  print(logrank_results_list[[test_name]])
+  cat("\n")
+}
+```
+
+```{r}
+cat("Total subjects in survival_data:", length(unique(survival_data$BID)), "\n")
+
+survival_long_all <- survival_data |>
+  pivot_longer(
+    cols = all_of(test_vars),
+    names_to = "Test",
+    values_to = "Score"
+  )
+
+cat("Total rows in long data (before filtering NA Scores):", nrow(survival_long_all), "\n")
+cat("Total unique subjects in long data:", length(unique(survival_long_all$BID)), "\n")
+
+survival_long_filtered <- survival_long_all |>
+  filter(!is.na(Score))
+
+cat("Total rows after filtering NA Scores:", nrow(survival_long_filtered), "\n")
+cat("Total unique subjects after filtering NA Scores:", length(unique(survival_long_filtered$BID)), "\n")
 ```
