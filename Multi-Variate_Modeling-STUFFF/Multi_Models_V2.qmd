@@ -1,0 +1,854 @@
+---
+title: "Multi-Model Analysis with All 12 Tests"
+author: "Ian/Tsel"
+format: html
+---
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(table1)
+library(dplyr)
+library(tidyr) 
+library(purrr) 
+library(ggplot2)
+library(patchwork)
+library(broom)
+library(stringr)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(DescTools)
+library(arsenal)
+library(nlme)
+library(emmeans)
+library(splines)
+library(clubSandwich)
+library(forcats)
+library(forestplot)
+library(glmnet)      
+library(car)        
+library(performance) 
+library(see)       
+library(leaps)     
+
+formatp <- function(x) case_when(
+  x < 0.001 ~ "p<0.001",
+  x > 0.01 ~ Hmisc::format.pval(x, digits=2, eps=0.01, nsmall=2),
+  TRUE ~ Hmisc::format.pval(x, digits=3, eps=0.001, nsmall=3))
+```
+
+```{r read-data, message=FALSE}
+# Reading Data stuffff
+ADQS_raw <- read_csv("ISI-BUDS_Research/ISI-BUDS_Research_Proj/data/ADQS.csv")
+CDR_raw <- read_csv("ISI-BUDS_Research/ISI-BUDS_Research_Proj/data/cdr.csv")
+C3_raw <- read_csv("ISI-BUDS_Research/ISI-BUDS_Research_Proj/data/cogstate_battery.csv")
+SUBJINFO_raw <- read_csv("ISI-BUDS_Research/ISI-BUDS_Research_Proj/data/SUBJINFO.csv")
+SPINFO_raw <- read_csv("ISI-BUDS_Research/ISI-BUDS_Research_Proj/data/spinfo.csv")
+cfi_raw <- read_csv("ISI-BUDS_Research/ISI-BUDS_Research_Proj/data/cfi.csv")
+ptau217_raw <- read_csv("ISI-BUDS_Research/ISI-BUDS_Research_Proj/data/biomarker_pTau217.csv")
+```
+
+```{r setup-data}
+# Getting placebo groupp
+SUBJINFO_PLAC <- SUBJINFO_raw |> 
+  filter(TX %in% "Placebo")
+
+placebo_bids <- SUBJINFO_PLAC$BID
+
+# CDR prep n such
+CDR_ind <- CDR_raw |> 
+  select(c("BID", "CDGLOBAL","CDADTC_DAYS_T0")) |> 
+  filter(BID %in% placebo_bids) |>
+  filter(CDADTC_DAYS_T0 >= 0) |> 
+  mutate(WEEK = CDADTC_DAYS_T0 / 7) |> 
+  filter(WEEK <= 252)
+
+target_weeks <- c(48, 108, 168, 204, 240)
+window_weeks <- 12 
+
+# Processing CDR in timeframess
+CDR_closest_week_windowed <- CDR_ind |>
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) |>
+  unnest(distance_to_target) |>
+  group_by(BID, WEEK, CDGLOBAL) |>
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) |>
+  ungroup() |> 
+  filter(abs(WEEK - target_week) <= window_weeks) |>
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup() |> 
+  mutate(range = target_week - WEEK)
+
+# Create wide format CDR indicator
+wide_cdr_indicator <- CDR_closest_week_windowed |>
+  mutate(CD_indicator = if_else(CDGLOBAL > 0, 1, 0)) |>
+  select(BID, target_week, CD_indicator) |> 
+  pivot_wider(
+    names_from = target_week,
+    values_from = CD_indicator, 
+    names_prefix = "CDPOS_W",   
+    values_fill = NA)
+
+# Add convert times
+conversion_times <- CDR_closest_week_windowed |>
+  filter(CDGLOBAL > 0) |>
+  group_by(BID) |>
+  summarise(CDRCONV_WEEK = min(WEEK))
+
+wide_cdr_indicator <- left_join(wide_cdr_indicator, conversion_times, by = "BID")
+```
+
+```{r prepare-all-test-data}
+# Function to process test scores (modified to handle baseline better)
+process_and_model_delta_scores <- function(adqs_data, test_code, target_weeks, window_weeks, outcome_data, outcome_var) {
+  
+  # Data Preparation
+  test_data <- adqs_data |>
+    filter(toupper(QSTESTCD) == test_code, TX == "Placebo") |>
+    select(BID, WEEK = ADURW, SCORE = QSSTRESN) |>
+    filter(!is.na(WEEK), !is.na(SCORE))
+  
+  if (nrow(test_data) == 0) {
+    return(NULL)
+  }
+  
+  # Find Closest Visit within Window for All Timepoints
+  closest <- test_data |>
+    mutate(
+      tmp = map(WEEK, ~ abs(.x - target_weeks)),
+      target_week = map_int(tmp, ~ target_weeks[which.min(.x)])
+    ) |>
+    select(-tmp) |>
+    filter(abs(WEEK - target_week) <= window_weeks) |>
+    group_by(BID, target_week) |>
+    slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+    ungroup()
+  
+  # Identify Best Baseline and Pivot Follow-up Scores
+  baseline_scores <- closest |>
+    filter(target_week <= 0) |>
+    group_by(BID) |>
+    slice_max(order_by = target_week, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(BID, baseline_score = SCORE)
+  
+  # Pivot only the follow-up scores into a wide format
+  wide_followup_scores <- closest |>
+    filter(target_week > 0) |>
+    select(BID, target_week, SCORE) |>
+    pivot_wider(
+      id_cols = BID,
+      names_from = target_week,
+      values_from = SCORE,
+      names_prefix = paste0(tolower(test_code), "_W"),
+      values_fn = mean  # Take mean if multiple values exist
+    )
+  
+  # Join Baseline and Calculate Deltas
+  wide_scores_with_deltas <- wide_followup_scores |>
+    inner_join(baseline_scores, by = "BID") |>
+    mutate(across(
+      .cols = starts_with(paste0(tolower(test_code), "_W")),
+      .fns = ~ .x - baseline_score,
+      .names = "delta_{.col}"
+    )) |>
+    select(BID, starts_with("delta_"))  # Only keep BID and delta columns
+  
+  return(wide_scores_with_deltas)
+}
+
+# Process C3 data separately
+c3_clean <- C3_raw |>
+  select(BID, TDate_DAYS_T0, C3Comp) |>
+  na.omit() |>
+  distinct(BID, TDate_DAYS_T0, .keep_all = TRUE) |> 
+  filter(BID %in% placebo_bids) |>
+  mutate(WEEK = TDate_DAYS_T0 / 7) |>
+  select(BID, WEEK, C3_SCORE = C3Comp, TDate_DAYS_T0)
+
+# Get C3 baseline
+c3_baseline <- c3_clean |>
+  filter(WEEK <= 0) |>
+  group_by(BID) |>
+  slice_max(order_by = WEEK, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(BID, C3_BASELINE = C3_SCORE)
+
+# Calculate C3 changes
+c3_with_change <- c3_clean |>
+  inner_join(c3_baseline, by = "BID") |>
+  mutate(C3_CHANGE = C3_SCORE - C3_BASELINE) |> 
+  filter(WEEK > 0) |> 
+  select(BID, TDate_DAYS_T0, WEEK, C3_SCORE, C3_BASELINE, C3_CHANGE)
+
+# Process C3 for each target week
+c3_closest_visits <- c3_with_change |>
+  select(BID, WEEK, C3_CHANGE) |>
+  mutate(
+    distance_to_target = map(WEEK, ~ abs(.x - target_weeks)),
+    target_week = map_int(distance_to_target, ~ target_weeks[which.min(.x)])
+  ) |>
+  filter(abs(WEEK - target_week) <= window_weeks) |>
+  group_by(BID, target_week) |>
+  slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(BID, target_week, C3_CHANGE)
+
+# Create wide format for C3
+c3_wide <- c3_closest_visits |>
+  pivot_wider(
+    names_from = target_week,
+    values_from = C3_CHANGE,
+    names_prefix = "c3_W",
+    values_fn = mean  # Take mean if multiple values exist
+  ) |>
+  mutate(across(
+    .cols = starts_with("c3_W"),
+    .names = "delta_{.col}"
+  )) |>
+  select(BID, starts_with("delta_"))  # Only keep BID and delta columns
+
+# Define all 12 test codes (11 from ADQS + C3)
+test_codes_adqs <- c("MMSE", "ADLTOTAL", "ADLPQPT", "LMIIA", "CFITOTAL", 
+                     "ADLPQSP", "CFISP", "PACC", "DIGIT", "CFIPT", "FCSRT96")
+
+# Process all ADQS tests
+target_weeks_with_baseline <- c(0, 48, 108, 168, 204, 240)
+
+# Process each test separately and combine
+all_adqs_deltas <- NULL
+for(code in test_codes_adqs) {
+  test_result <- process_and_model_delta_scores(ADQS_raw, code, target_weeks_with_baseline, 14, wide_cdr_indicator, "CDPOS_W240")
+  if(!is.null(test_result)) {
+    if(is.null(all_adqs_deltas)) {
+      all_adqs_deltas <- test_result
+    } else {
+      all_adqs_deltas <- all_adqs_deltas |>
+        full_join(test_result, by = "BID")
+    }
+  }
+}
+
+# Combine all test data (ADQS tests + C3)
+model_data <- all_adqs_deltas |>
+  inner_join(c3_wide |> select(BID, starts_with("delta_")), by = "BID") |>
+  inner_join(wide_cdr_indicator |> select(BID, CDPOS_W240), by = "BID") |>
+  filter(!is.na(CDPOS_W240))
+
+# Check for list columns and convert to numeric if necessary
+list_cols <- sapply(model_data, is.list)
+if(any(list_cols)) {
+  list_col_names <- names(model_data)[list_cols]
+  cat("Warning: List columns detected:", paste(list_col_names, collapse = ", "), "\n")
+  cat("Converting to numeric by taking first value...\n")
+  
+  for(col in list_col_names) {
+    model_data[[col]] <- sapply(model_data[[col]], function(x) {
+      if(is.null(x) || length(x) == 0) NA else as.numeric(x[1])
+    })
+  }
+}
+
+# Print all available tests
+cat("=== ALL 12 TESTS INCLUDED IN ANALYSIS ===\n")
+cat("ADQS Tests (11):", paste(test_codes_adqs, collapse = ", "), "\n")
+cat("Additional Test: C3 (Cogstate Composite)\n")
+cat("Total: 12 cognitive tests\n\n")
+```
+
+```{r individual-logistic-regression}
+# Get all delta variables
+delta_vars <- model_data |>
+  select(starts_with("delta_")) |>
+  names()
+
+# Run individual logistic regression for each delta
+model_results <- lapply(delta_vars, function(delta_var) {
+  formula <- as.formula(paste("CDPOS_W240 ~", delta_var))
+  model <- tryCatch(glm(formula, data = model_data, family = binomial()),
+                    error = function(e) NULL,
+                    warning = function(w) invokeRestart("muffleWarning"))
+  if (is.null(model)) return(NULL)
+
+  tidy(model, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(delta_var = delta_var)
+}) |>
+  compact() |>  
+  bind_rows()
+
+# Format results
+final_model_results <- model_results |>
+  mutate(
+    measure = str_extract(delta_var, "(?<=delta_)[a-z0-9]+"),
+    week = as.integer(str_extract(delta_var, "\\d+$"))
+  ) |>
+  select(measure, week, OR = estimate, CI_low = conf.low, CI_high = conf.high, p.value)
+
+# Display individual model results table
+final_model_results |>
+  filter(week != 0) |>
+  mutate(
+    OR = round(OR, 3), 
+    CI_low = round(CI_low, 3), 
+    CI_high = round(CI_high, 3),
+    p.value = signif(p.value, 3), 
+    pval_formatted = ifelse(p.value < 0.001, formatC(p.value, format = "e", digits = 2), round(p.value, 3))
+  ) |>
+  rename(`Cognitive Test` = measure) |>
+  mutate(`Cognitive Test` = toupper(`Cognitive Test`)) |>
+  arrange(`Cognitive Test`, week) |>
+  select(`Cognitive Test`, week, OR, CI_low, CI_high, pval_formatted) |>
+  kable(
+    caption = "Summary of Individual Logistic Regression Odds Ratios by Cognitive Test (All 12 Tests)",
+    col.names = c("Cognitive Test", "Week", "Odds Ratio", "Lower 95% CI", "Upper 95% CI", "p-value"),
+    digits = 3,
+    align = "lccccr"
+  ) |>
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r plot-individual-results, fig.width=15, fig.height=12}
+# Define custom colors for 12 tests
+custom_colors <- c('#6CA6CD', '#2F4F4F', '#B8860B', '#6959CD', '#A0522D', 
+                   '#27408B', '#8B8378', '#68228B', '#458B00', '#8B0A50', 
+                   '#c62828', '#ff6f00')
+
+# Create visualization
+ggplot(final_model_results |> filter(week > 0), aes(x = week, y = OR, color = measure)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 5) +
+  geom_hline(yintercept = 1, linetype = "dashed") + 
+  facet_wrap(~measure, scales = "free_y", ncol = 4) +
+  scale_x_continuous(limits = c(40, NA)) +  
+  scale_color_manual(values = custom_colors) +
+  labs(title = "Individual Odds Ratios for All 12 Cognitive Tests by Week After Baseline", 
+       x = "Week",
+       y = expression("Odds Ratio (" * e^{beta} * ")")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 18, face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12, face = "bold"),
+        strip.text = element_text(size = 14, face = "bold"))
+
+ggsave("all_12_tests_individual_odds_ratios.png", width = 15, height = 12, units = "in", dpi = 300)
+```
+
+```{r combined-glm}
+# Prepare data in long format for combined GLM
+model_data_long <- model_data |>
+  select(BID, CDPOS_W240, starts_with("delta_")) |>
+  pivot_longer(
+    cols = starts_with("delta_"),
+    names_to = "test_week",
+    values_to = "delta_score"
+  ) |>
+  filter(!is.na(delta_score), !is.na(CDPOS_W240)) |>
+  mutate(
+    measure = str_extract(test_week, "(?<=delta_)[a-z0-9]+"),
+    week = as.integer(str_extract(test_week, "\\d+$"))
+  ) |>
+  filter(week %in% c(48, 108, 168, 204, 240))
+
+# Fit combined GLM for each week with ALL tests together
+combined_glm_results <- list()
+
+for(wk in c(48, 108, 168, 204, 240)) {
+  # Get data for this specific week
+  week_data <- model_data_long |>
+    filter(week == wk) |>
+    select(BID, CDPOS_W240, measure, delta_score) |>
+    pivot_wider(
+      id_cols = c(BID, CDPOS_W240),
+      names_from = measure,
+      values_from = delta_score,
+      names_prefix = "delta_"
+    ) |>
+    select(-BID) |>
+    na.omit()
+  
+  n_obs <- nrow(week_data)
+  n_vars <- ncol(week_data) - 1  # minus outcome
+  
+  cat(paste0("\nWeek ", wk, ": N = ", n_obs, ", Variables = ", n_vars, "\n"))
+  
+  if(n_obs > 50 && length(unique(week_data$CDPOS_W240)) == 2) {
+    # Fit combined GLM with all tests
+    combined_glm <- glm(CDPOS_W240 ~ ., 
+                       data = week_data,
+                       family = binomial())
+    
+    # Extract results
+    week_results <- tidy(combined_glm, exponentiate = TRUE, conf.int = TRUE) |>
+      filter(term != "(Intercept)") |>
+      mutate(
+        week = wk,
+        measure = str_extract(term, "(?<=delta_)[a-z0-9]+")
+      ) |>
+      select(measure, week, OR = estimate, CI_low = conf.low, CI_high = conf.high, p.value)
+    
+    combined_glm_results[[as.character(wk)]] <- week_results
+    
+    # Show summary
+    cat("Converged:", combined_glm$converged, "\n")
+    cat("AIC:", AIC(combined_glm), "\n")
+  }
+}
+
+# Combine all results
+final_combined_results <- bind_rows(combined_glm_results)
+
+# Create table of combined model results
+combined_results_table <- final_combined_results |>
+  mutate(
+    Test = toupper(measure),
+    `Odds Ratio (95% CI)` = paste0(round(OR, 3), " (", round(CI_low, 3), "-", round(CI_high, 3), ")"),
+    `p-value` = formatp(p.value),
+    Significant = ifelse(p.value < 0.05, "*", "")
+  ) |>
+  select(Test, Week = week, `Odds Ratio (95% CI)`, `p-value`, Significant) |>
+  arrange(Test, Week)
+
+kable(combined_results_table,
+      caption = "Combined GLM Results: All 12 Tests Together at Each Week",
+      align = "lcccc") |>
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r plot-combined-glm, fig.width=15, fig.height=12}
+# Create visualization for combined GLM
+ggplot(final_combined_results, aes(x = week, y = OR, color = measure)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 5, size = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black", alpha = 0.5) + 
+  facet_wrap(~measure, scales = "free_y", ncol = 4) +
+  scale_x_continuous(breaks = c(48, 108, 168, 204, 240), limits = c(40, 250)) +  
+  scale_color_manual(values = custom_colors) +
+  labs(
+    title = "Combined GLM Results: All 12 Cognitive Tests Modeled Together",
+    subtitle = "Odds ratios from models including all 12 tests simultaneously at each time point",
+    x = "Week After Baseline",
+    y = expression("Odds Ratio (" * e^{beta} * ")")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 12, color = "gray40"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12, face = "bold"),
+    strip.text = element_text(size = 14, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("glm_combined_results_12_tests.png", width = 15, height = 12, units = "in", dpi = 300)
+```
+
+```{r best-subsets}
+# Best Subsets Selection
+library(leaps)
+
+# Initialize results storage
+best_subsets_results <- list()
+selected_variables_by_week <- list()
+
+cat("=== BEST SUBSETS ANALYSIS USING ALL 12 TESTS ===\n")
+
+# Loop through all weeks
+for(wk in c(48, 108, 168, 204, 240)) {
+  
+  cat(paste0("\n========== WEEK ", wk, " ==========\n"))
+  
+  # Prepare data for this week
+  week_data <- model_data_long |>
+    filter(week == wk) |>
+    select(BID, CDPOS_W240, measure, delta_score) |>
+    pivot_wider(
+      id_cols = c(BID, CDPOS_W240),
+      names_from = measure,
+      values_from = delta_score,
+      names_prefix = "delta_"
+    )
+  
+  # Remove BID and handle missing values
+  analysis_data <- week_data |>
+    select(-BID) |>
+    na.omit()
+  
+  n_obs <- nrow(analysis_data)
+  n_vars <- ncol(analysis_data) - 1
+  
+  cat(paste0("Sample size: N = ", n_obs, "\n"))
+  cat(paste0("Available predictors: ", n_vars, "\n"))
+  
+  if(n_obs > 50 && length(unique(analysis_data$CDPOS_W240)) == 2 && n_vars > 0) {
+    
+    # Run best subsets selection
+    regsubsets_out <- regsubsets(CDPOS_W240 ~ ., 
+                                 data = analysis_data, 
+                                 nvmax = n_vars,
+                                 method = "exhaustive")
+    
+    # Get summary
+    reg_summary <- summary(regsubsets_out)
+    
+    # Model selection criteria
+    best_adjr2 <- which.max(reg_summary$adjr2)
+    best_bic <- which.min(reg_summary$bic)
+    best_cp <- which.min(reg_summary$cp)
+    
+    cat(paste0("\nBest model sizes:\n"))
+    cat(paste0("  By Adjusted R²: ", best_adjr2, " variables\n"))
+    cat(paste0("  By BIC: ", best_bic, " variables\n"))
+    cat(paste0("  By Cp: ", best_cp, " variables\n"))
+    
+    # Use BIC criterion (most parsimonious)
+    best_model_size <- best_bic
+    
+    # Get selected variables
+    selected_vars <- names(coef(regsubsets_out, best_model_size))[-1]  # exclude intercept
+    
+    cat(paste0("\nSelected ", length(selected_vars), " variables (BIC criterion):\n"))
+    cat(paste0("  ", paste(selected_vars, collapse = ", "), "\n"))
+    
+    # Fit the best subset model
+    if(length(selected_vars) > 0) {
+      formula_best <- as.formula(paste("CDPOS_W240 ~", paste(selected_vars, collapse = " + ")))
+      best_model <- glm(formula_best, data = analysis_data, family = binomial())
+      
+      # Extract coefficients with significance
+      model_summary <- summary(best_model)
+      coef_table <- as.data.frame(model_summary$coefficients)
+      coef_table$Variable <- rownames(coef_table)
+      
+      # Calculate odds ratios
+      coef_table$OR <- exp(coef_table$Estimate)
+      coef_table$OR_CI_lower <- exp(coef_table$Estimate - 1.96 * coef_table$`Std. Error`)
+      coef_table$OR_CI_upper <- exp(coef_table$Estimate + 1.96 * coef_table$`Std. Error`)
+      
+      # Format p-values
+      coef_table$p_formatted <- ifelse(coef_table$`Pr(>|z|)` < 0.001, "<0.001", 
+                                       round(coef_table$`Pr(>|z|)`, 3))
+      
+      # Model performance metrics
+      null_model <- glm(CDPOS_W240 ~ 1, data = analysis_data, family = binomial())
+      mcfadden_r2 <- 1 - (logLik(best_model)/logLik(null_model))
+      
+      # Store results
+      best_subsets_results[[as.character(wk)]] <- list(
+        week = wk,
+        n_obs = n_obs,
+        n_vars_available = n_vars,
+        n_vars_selected = length(selected_vars),
+        selected_vars = selected_vars,
+        model = best_model,
+        aic = AIC(best_model),
+        bic = BIC(best_model),
+        mcfadden_r2 = as.numeric(mcfadden_r2),
+        coefficients = coef_table
+      )
+      
+      selected_variables_by_week[[as.character(wk)]] <- selected_vars
+      
+      # Print model statistics
+      cat(paste0("\nModel Performance:\n"))
+      cat(paste0("  AIC: ", round(AIC(best_model), 2), "\n"))
+      cat(paste0("  BIC: ", round(BIC(best_model), 2), "\n"))
+      cat(paste0("  McFadden R²: ", round(as.numeric(mcfadden_r2), 3), "\n"))
+    }
+  }
+}
+
+# Create summary of selected variables across weeks
+cat("\n\n========== SUMMARY ACROSS ALL WEEKS ==========\n")
+
+# Variable selection frequency
+all_vars <- unique(unlist(selected_variables_by_week))
+var_frequency <- sapply(all_vars, function(v) {
+  sum(sapply(selected_variables_by_week, function(week_vars) v %in% week_vars))
+})
+
+var_freq_df <- data.frame(
+  Variable = all_vars,
+  Frequency = var_frequency,
+  Percentage = round(var_frequency / length(selected_variables_by_week) * 100, 1)
+) |>
+  arrange(desc(Frequency))
+
+cat("\nVariable Selection Frequency:\n")
+print(kable(var_freq_df,
+            caption = "How Often Each Variable Was Selected Across Weeks (All 12 Tests)",
+            col.names = c("Variable", "Times Selected", "Percentage"),
+            align = "lcc") |>
+      kable_styling(full_width = FALSE))
+```
+
+```{r plot-best-subsets, fig.width=10, fig.height=10}
+# Create visualization of variable selection patterns
+selection_matrix <- matrix(0, nrow = length(all_vars), ncol = length(c(48, 108, 168, 204, 240)))
+rownames(selection_matrix) <- all_vars
+colnames(selection_matrix) <- paste0("Week ", c(48, 108, 168, 204, 240))
+
+for(wk in names(selected_variables_by_week)) {
+  week_col <- paste0("Week ", wk)
+  vars <- selected_variables_by_week[[wk]]
+  selection_matrix[vars, week_col] <- 1
+}
+
+# Convert to long format for plotting
+selection_long <- as.data.frame(selection_matrix) |>
+  mutate(Variable = rownames(selection_matrix)) |>
+  pivot_longer(cols = starts_with("Week"),
+               names_to = "Week",
+               values_to = "Selected") |>
+  mutate(Week = as.integer(gsub("Week ", "", Week)))
+
+# Create heatmap
+ggplot(selection_long, aes(x = factor(Week), y = Variable, fill = factor(Selected))) +
+  geom_tile(color = "white", size = 0.5) +
+  scale_fill_manual(values = c("0" = "white", "1" = "#3498db"),
+                    labels = c("Not Selected", "Selected")) +
+  labs(title = "Variable Selection Patterns Across Weeks - All 12 Tests",
+       subtitle = "Best subsets selection using BIC criterion",
+       x = "Week After Baseline",
+       y = "Variable",
+       fill = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12, color = "gray40"),
+        axis.text.x = element_text(size = 11),
+        axis.text.y = element_text(size = 10),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.position = "bottom")
+
+ggsave("best_subsets_selection_pattern_12_tests.png", width = 10, height = 10, units = "in", dpi = 300)
+```
+
+```{r ridge-regression}
+# Ridge Regression Analysis
+library(glmnet)
+library(pROC)
+
+# Initialize storage for ridge regression results
+ridge_results_all_weeks <- list()
+ridge_coefficients_all_weeks <- list()
+
+cat("=== RIDGE REGRESSION ANALYSIS FOR ALL 12 TESTS ===\n")
+
+# Loop through each week
+for(wk in c(48, 108, 168, 204, 240)) {
+  
+  cat(paste0("\n========== WEEK ", wk, " ==========\n"))
+  
+  # Prepare data for this week
+  week_data <- model_data_long |>
+    filter(week == wk) |>
+    select(BID, CDPOS_W240, measure, delta_score) |>
+    pivot_wider(
+      id_cols = c(BID, CDPOS_W240),
+      names_from = measure,
+      values_from = delta_score,
+      names_prefix = "delta_"
+    )
+  
+  # Remove BID and handle missing values
+  analysis_data <- week_data |>
+    select(-BID) |>
+    na.omit()
+  
+  n_obs <- nrow(analysis_data)
+  n_vars <- ncol(analysis_data) - 1
+  
+  cat(paste0("Sample size: N = ", n_obs, "\n"))
+  cat(paste0("Number of predictors: ", n_vars, "\n"))
+  
+  if(n_obs > 50 && n_vars > 0) {
+    
+    # Prepare matrices for glmnet
+    X <- as.matrix(analysis_data[, -1])  # all predictors
+    y <- analysis_data$CDPOS_W240
+    
+    # Standardize variable names for display
+    colnames(X) <- gsub("delta_", "", colnames(X))
+    
+    # Cross-validation to find optimal lambda
+    set.seed(123)
+    cv_ridge <- cv.glmnet(X, y, 
+                         family = "binomial",
+                         alpha = 0,  # Ridge regression
+                         nfolds = 10,
+                         lambda = exp(seq(log(0.001), log(100), length.out = 100)))
+    
+    # Extract optimal lambdas
+    lambda_min <- cv_ridge$lambda.min
+    lambda_1se <- cv_ridge$lambda.1se
+    
+    cat(paste0("\nOptimal lambda values:\n"))
+    cat(paste0("  Lambda (min): ", round(lambda_min, 4), "\n"))
+    cat(paste0("  Lambda (1SE): ", round(lambda_1se, 4), "\n"))
+    
+    # Use lambda.min
+    lambda_use <- lambda_min
+    
+    # Fit ridge model
+    ridge_model <- glmnet(X, y, 
+                         family = "binomial",
+                         alpha = 0,
+                         lambda = lambda_use)
+    
+    # Extract coefficients
+    ridge_coef <- as.matrix(coef(ridge_model))
+    ridge_coef_df <- data.frame(
+      Variable = rownames(ridge_coef),
+      Coefficient = ridge_coef[,1],
+      Abs_Coefficient = abs(ridge_coef[,1])
+    ) |>
+      filter(Variable != "(Intercept)") |>
+      arrange(desc(Abs_Coefficient))
+    
+    # Calculate predictions and performance metrics
+    pred_prob <- predict(ridge_model, newx = X, type = "response")[,1]
+    
+    # ROC and AUC
+    roc_obj <- roc(y, pred_prob, quiet = TRUE)
+    auc_value <- auc(roc_obj)
+    
+    # Confusion matrix at 0.5 threshold
+    pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+    confusion <- table(Actual = y, Predicted = pred_class)
+    
+    # Calculate metrics
+    accuracy <- mean(y == pred_class)
+    
+    # Calculate sensitivity and specificity manually
+    true_positives <- sum(y == 1 & pred_class == 1)
+    true_negatives <- sum(y == 0 & pred_class == 0)
+    
+    sensitivity <- if(sum(y == 1) > 0) true_positives / sum(y == 1) else NA
+    specificity <- if(sum(y == 0) > 0) true_negatives / sum(y == 0) else NA
+    
+    # Store results
+    ridge_results_all_weeks[[as.character(wk)]] <- list(
+      week = wk,
+      n_obs = n_obs,
+      n_vars = n_vars,
+      lambda_min = lambda_min,
+      lambda_1se = lambda_1se,
+      lambda_used = lambda_use,
+      model = ridge_model,
+      cv_model = cv_ridge,
+      coefficients = ridge_coef_df,
+      auc = as.numeric(auc_value),
+      accuracy = accuracy,
+      sensitivity = sensitivity,
+      specificity = specificity
+    )
+    
+    ridge_coefficients_all_weeks[[as.character(wk)]] <- ridge_coef_df
+    
+    # Print top coefficients
+    cat(paste0("\nTop 5 predictors by absolute coefficient value:\n"))
+    top_5 <- head(ridge_coef_df, 5)
+    for(i in 1:nrow(top_5)) {
+      cat(paste0("  ", top_5$Variable[i], ": ", round(top_5$Coefficient[i], 4), "\n"))
+    }
+    
+    # Print performance metrics
+    cat(paste0("\nModel Performance:\n"))
+    cat(paste0("  AUC: ", round(auc_value, 3), "\n"))
+    cat(paste0("  Accuracy: ", round(accuracy, 3), "\n"))
+    cat(paste0("  Sensitivity: ", ifelse(is.na(sensitivity), "NA", round(sensitivity, 3)), "\n"))
+    cat(paste0("  Specificity: ", ifelse(is.na(specificity), "NA", round(specificity, 3)), "\n"))
+  }
+}
+
+# Create performance summary table
+performance_summary <- do.call(rbind, lapply(ridge_results_all_weeks, function(res) {
+  data.frame(
+    Week = res$week,
+    N = res$n_obs,
+    `Lambda (min)` = round(res$lambda_min, 4),
+    AUC = round(res$auc, 3),
+    Accuracy = round(res$accuracy, 3),
+    Sensitivity = round(res$sensitivity, 3),
+    Specificity = round(res$specificity, 3)
+  )
+}))
+
+print(kable(performance_summary,
+            caption = "Ridge Regression Performance Summary - All 12 Tests",
+            align = "lcccccc") |>
+      kable_styling(full_width = FALSE))
+```
+
+```{r plot-ridge-results, fig.width=12, fig.height=8}
+# Get all unique variables
+all_vars <- unique(unlist(lapply(ridge_coefficients_all_weeks, function(df) df$Variable)))
+
+# Create matrix of coefficients
+coef_matrix <- matrix(0, nrow = length(all_vars), ncol = length(c(48, 108, 168, 204, 240)))
+rownames(coef_matrix) <- all_vars
+colnames(coef_matrix) <- paste0("Week_", c(48, 108, 168, 204, 240))
+
+for(wk in names(ridge_coefficients_all_weeks)) {
+  week_col <- paste0("Week_", wk)
+  coef_df <- ridge_coefficients_all_weeks[[wk]]
+  for(i in 1:nrow(coef_df)) {
+    coef_matrix[coef_df$Variable[i], week_col] <- coef_df$Coefficient[i]
+  }
+}
+
+# Find consistently important variables
+coef_importance <- data.frame(
+  Variable = rownames(coef_matrix),
+  Mean_Abs_Coef = rowMeans(abs(coef_matrix)),
+  SD_Coef = apply(coef_matrix, 1, sd),
+  Times_Positive = rowSums(coef_matrix > 0),
+  Times_Negative = rowSums(coef_matrix < 0)
+) |>
+  arrange(desc(Mean_Abs_Coef))
+
+# Visualization: Coefficient paths for top variables
+top_vars <- head(coef_importance$Variable, 12)  # Show all 12 tests
+coef_plot_data <- as.data.frame(coef_matrix[top_vars, ])
+coef_plot_data$Variable <- rownames(coef_plot_data)
+coef_plot_data <- coef_plot_data |>
+  pivot_longer(cols = starts_with("Week_"),
+               names_to = "Week",
+               values_to = "Coefficient") |>
+  mutate(Week = as.integer(gsub("Week_", "", Week)))
+
+ggplot(coef_plot_data, aes(x = Week, y = Coefficient, color = Variable)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  labs(title = "Ridge Regression Coefficients Over Time - All 12 Tests",
+       subtitle = "Showing all cognitive tests",
+       x = "Week After Baseline",
+       y = "Coefficient Value") +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(48, 108, 168, 204, 240)) +
+  scale_color_manual(values = custom_colors) +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12, color = "gray40"),
+        legend.position = "right")
+
+ggsave("ridge_coefficient_paths_12_tests.png", width = 12, height = 8, units = "in", dpi = 300)
+```
+
+```{r summary}
+# Print final summary
+cat("\n\n=== FINAL SUMMARY: ANALYSIS WITH ALL 12 COGNITIVE TESTS ===\n")
+cat("\nTests included:\n")
+cat("- ADQS Tests (11):", paste(test_codes_adqs, collapse = ", "), "\n")
+cat("- Cogstate Test: C3\n")
+cat("\nAnalyses performed:\n")
+cat("1. Individual logistic regression for each test at each time point\n")
+cat("2. Combined GLM with all 12 tests together at each time point\n")
+cat("3. Best subsets selection to identify optimal test combinations\n")
+cat("4. Ridge regression for regularized coefficient estimation\n")
+cat("\nAll analyses completed successfully.\n")
+```
