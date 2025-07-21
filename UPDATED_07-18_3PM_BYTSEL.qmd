@@ -1,0 +1,898 @@
+---
+title: "c3-ptau-work"
+format: html
+author: "Tselmen Anuurad"
+---
+
+```{r}
+library(tidyverse)
+library(table1)
+library(dplyr)
+library(tidyr) 
+library(purrr) 
+library(ggplot2)
+library(patchwork)
+library(broom)
+library(stringr)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(DescTools)
+```
+
+```{r}
+ADQS_raw <- read_csv("Derived Data/ADQS.csv")
+CDR_raw <- read_csv("Raw Data/cdr.csv")
+C3_raw <- read_csv("External Data/cogstate_battery.csv")
+SUBJINFO_raw <- read_csv("Derived Data/SUBJINFO.csv")
+```
+
+```{r}
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "001") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "006") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw %>%
+  left_join(V6OUTCOME, by = "BID") %>%
+  left_join(V1OUTCOME %>%
+      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") %>%
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+
+# Filter ADQS_raw for PACC collected in the blinded phases among mITT population
+ADQS_PACC <- ADQS_raw %>%
+  filter(MITTFL== 1) %>%
+  filter(EPOCH == "BLINDED TREATMENT" | AVISIT == "006") %>%
+  filter(QSTESTCD == "PACC") %>%
+  rename(PACC = QSSTRESN) %>%
+  select(BID, ASEQNCS, TX, ADURW, TX, AGEYR, 
+    AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) %>%
+  mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) %>%
+  na.omit()
+
+# placebo group SUBJINFO
+SUBJINFO_PLAC <- SUBJINFO |> 
+  filter(TX %in% "Placebo")
+
+placebo_bids <- SUBJINFO_PLAC$BID
+```
+
+
+## 12 Week Window Indicator Table
+
+```{r}
+# prep raw CDR file for use
+CDR_ind <- CDR_raw |> 
+  select(c("BID", "CDGLOBAL","CDADTC_DAYS_T0")) |> 
+  filter(BID %in% placebo_bids) |>
+  filter(CDADTC_DAYS_T0 >= 0) |> 
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  ) |> 
+  filter(WEEK <= 252)
+
+# defining our target weeks and the window size
+target_weeks <- c(48, 108, 168, 204, 240)
+window_weeks <- 12 
+
+CDR_closest_week_windowed <- CDR_ind |>
+  # for each visit, calculate its distance to ALL target weeks
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) |>
+  unnest(distance_to_target) |>
+  
+  # identify which target week is the closest for that visit
+  group_by(BID, WEEK, CDGLOBAL) |>
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) |>
+  ungroup() |> 
+
+  filter(abs(WEEK - target_week) <= window_weeks) |>
+
+  # for each subject and target week, if there happen to be
+  # multiple visits in the window, keep the single closest one
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup() |> 
+  mutate(
+    range = target_week - WEEK
+  )
+
+wide_cdr_indicator <- CDR_closest_week_windowed |>
+  mutate(
+    CD_indicator = if_else(CDGLOBAL > 0, 1, 0)
+  ) |>
+  select(BID, target_week, CD_indicator) |> 
+  pivot_wider(
+    names_from = target_week,
+    values_from = CD_indicator, 
+    names_prefix = "CDPOS_W",   
+    values_fill = NA 
+  ) 
+
+# when is the first time of global cdr conversion?
+conversion_times <- 
+  CDR_closest_week_windowed |>
+  filter(CDGLOBAL > 0) |>
+  group_by(BID) |>
+  summarise(
+    CDRCONV_WEEK = min(WEEK)
+  )
+
+# final dataframe with indicator + min time to global cdr conversion
+wide_cdr_indicator <- left_join(wide_cdr_indicator, conversion_times, by = "BID") 
+```
+
+## All Plots
+
+Modified, again, for 12 week window (most up to date 07/18 3 pm)
+
+```{r}
+# --- Reusable Logistic Regression Function ---
+
+# This function now calculates and includes the sample size (n) for each model.
+
+process_and_model_delta_scores0 <- function(adqs_data, test_code, target_weeks, window_weeks, outcome_data, outcome_var) {
+  
+  # --- 1. Data Preparation ---
+  test_data <- adqs_data |>
+    filter(toupper(QSTESTCD) == test_code, TX == "Placebo") |>
+    select(BID, WEEK = ADURW, SCORE = QSSTRESN) |>
+    filter(!is.na(WEEK),!is.na(SCORE))
+  
+  if (nrow(test_data) == 0) {
+    return(NULL)
+  }
+
+  # --- 2. Find Closest Visit within Window ---
+  closest <- test_data |>
+    mutate(
+      tmp = map(WEEK, ~ abs(.x - target_weeks)),
+      target_week = map_int(tmp, ~ target_weeks[which.min(.x)])
+    ) |>
+    select(-tmp) |>
+    filter(abs(WEEK - target_week) <= window_weeks) |>
+    group_by(BID, target_week) |>
+    slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+    ungroup()
+
+  # --- 3. Pivot to Wide Format & Calculate Deltas ---
+  wide_scores_with_deltas <- closest |>
+    select(BID, target_week, SCORE) |>
+    pivot_wider(
+      id_cols = BID,
+      names_from = target_week,
+      values_from = SCORE,
+      names_prefix = paste0(test_code, "_W")
+    ) |>
+    mutate(across(
+      .cols = all_of(paste0(test_code, "_W", target_weeks[target_weeks > 0])),
+      .fns = ~ .x - .data[[paste0(test_code, "_W0")]],
+      .names = "delta_{.col}"
+    ))
+
+  # --- 4. Prepare Final Data for Modeling ---
+  model_data <- wide_scores_with_deltas |>
+    inner_join(
+      outcome_data |> select(BID, all_of(outcome_var)),  
+      by = "BID"
+    ) |>
+    filter(!is.na(.data[[outcome_var]]))
+
+  # --- 5. Run Univariate Logistic Regression for Each Delta ---
+  delta_vars <- model_data |>
+    select(starts_with("delta_")) |>
+    names()
+  
+  models_results <- map(delta_vars, function(var) {
+    formula <- as.formula(paste(outcome_var, "~", var))
+    
+    model <- tryCatch(
+      glm(formula, data = model_data, family = binomial()),
+      error = function(e) NULL
+    )
+    
+    if (is.null(model)) return(NULL)
+    
+    # Use broom::tidy() to get a clean summary of the model.
+    tidy(model, exponentiate = TRUE, conf.int = TRUE) |>
+      filter(term != "(Intercept)") |>
+      mutate(
+        predictor_variable = var,
+        n = nobs(model) # <<< CHANGE 1: ADD SAMPLE SIZE FROM MODEL OBJECT
+      )
+  }) |>
+    compact() |> 
+    bind_rows()  
+
+  # --- 6. Format Final Results Table ---
+  if (nrow(models_results) > 0) {
+    final_results <- models_results |>
+      mutate(
+        test = test_code,
+        week = as.integer(str_extract(predictor_variable, "\\d+$"))
+      ) |>
+      rename(
+        OddsRatio = estimate,
+        LowerCI = conf.low,
+        UpperCI = conf.high,
+        p_value = p.value
+      ) |>
+      # <<< CHANGE 2: INCLUDE 'n' IN THE FINAL OUTPUT
+      select(test, week, n, predictor_variable, OddsRatio, LowerCI, UpperCI, p_value) 
+    
+    return(final_results)
+  } else {
+    return(NULL) 
+  }
+}
+```
+
+## How Far From Week 0 Were Tests Taken?
+
+```{r}
+adqs_data <- ADQS_raw
+test_code <- "ADLTOTAL"
+outcome_data <- wide_cdr_indicator
+target_weeks <- c(0, 48, 108, 168, 204, 240)
+
+test_data |> 
+  filter(WEEK < 0) |> 
+  ggplot(aes(x = WEEK)) + 
+  geom_histogram(binwidth = 2)
+
+summary_table <- test_data |>
+  # 1. Filter for weeks before baseline (week 0)
+  filter(WEEK < 0) |>
+  
+  # 2. Calculate all desired summary statistics
+  summarise(
+    # --- Measures of Central Tendency ---
+    mean = mean(WEEK),
+    median = median(WEEK),
+    mode = Mode(round(WEEK)),
+    min = min(WEEK),
+    max = max(WEEK),
+    within_12_wks = sum(WEEK >= -12), 
+    over_12_wks = sum(WEEK < -12), 
+    over_14_wks = sum(WEEK < -14)
+  )
+
+# 3. Print the final summary table
+print(summary_table)
+```
+
+07/19 
+
+```{r}
+adqs_data <- ADQS_raw
+test_code <- "ADLTOTAL"
+outcome_data <- wide_cdr_indicator
+target_weeks <- c(0, 48, 108, 168, 204, 240)
+
+process_and_model_delta_scores <- function(adqs_data, test_code, target_weeks, window_weeks, outcome_data, outcome_var) {
+  
+  # --- 1. Data Preparation ---
+  test_data <- adqs_data |>
+    filter(toupper(QSTESTCD) == test_code, TX == "Placebo") |>
+    select(BID, WEEK = ADURW, SCORE = QSSTRESN) |>
+    filter(!is.na(WEEK), !is.na(SCORE))
+  
+  if (nrow(test_data) == 0) {
+    return(NULL)
+  }
+  
+  # --- 2. Find Closest Visit within Window for All Timepoints ---
+  closest <- test_data |>
+    mutate(
+      tmp = map(WEEK, ~ abs(.x - target_weeks)),
+      target_week = map_int(tmp, ~ target_weeks[which.min(.x)])
+    ) |>
+    select(-tmp) |>
+    filter(abs(WEEK - target_week) <= window_weeks) |>
+    group_by(BID, target_week) |>
+    slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+    ungroup()
+  
+  # --- 3. Identify Best Baseline and Pivot Follow-up Scores ---
+  # This logic selects the best baseline for each subject (Week 0 or screening).
+  baseline_scores <- closest |>
+    filter(target_week <= 0) |>
+    group_by(BID) |>
+    slice_max(order_by = target_week, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(BID, baseline_score = SCORE, target_week)
+  
+  # Pivot only the follow-up scores into a wide format.
+  wide_followup_scores <- closest |>
+    filter(target_week > 0) |>
+    select(BID, target_week, SCORE) |>
+    pivot_wider(
+      id_cols = BID,
+      names_from = target_week,
+      values_from = SCORE,
+      names_prefix = paste0(test_code, "_W")
+    )
+  
+  # --- 4. Join Baseline and Calculate Deltas ---
+  # Join the single baseline score and calculate deltas from it.
+  wide_scores_with_deltas <- wide_followup_scores |>
+    inner_join(baseline_scores, by = "BID") |>
+    mutate(across(
+      .cols = starts_with(paste0(test_code, "_W")),
+      .fns = ~ .x - baseline_score,
+      .names = "delta_{.col}"
+    ))
+  
+  # --- Prepare Final Data for Modeling ---
+  model_data <- wide_scores_with_deltas |>
+    inner_join(
+      outcome_data |> select(BID, all_of(outcome_var)),
+      by = "BID"
+    ) |>
+    filter(!is.na(.data[[outcome_var]]))
+  
+  # --- 6. Run Univariate Logistic Regression for Each Delta (Original Logic) ---
+  delta_vars <- model_data |>
+    select(starts_with("delta_")) |>
+    names()
+  
+  models_results <- map(delta_vars, function(var) {
+    formula <- as.formula(paste(outcome_var, "~", var))
+    
+    model <- tryCatch(
+      glm(formula, data = model_data, family = binomial()),
+      error = function(e) NULL
+    )
+    
+    if (is.null(model)) return(NULL)
+    
+    # Use broom::tidy() to get a clean summary of the model.
+    tidy(model, exponentiate = TRUE, conf.int = TRUE) |>
+      filter(term != "(Intercept)") |>
+      mutate(
+        predictor_variable = var,
+        n = nobs(model)
+      )
+  }) |>
+    compact() |>
+    bind_rows()
+  
+  # --- 7. Format Final Results Table (Original Logic) ---
+  if (nrow(models_results) > 0) {
+    final_results <- models_results |>
+      mutate(
+        test = test_code,
+        week = as.integer(str_extract(predictor_variable, "\\d+$"))
+      ) |>
+      rename(
+        OddsRatio = estimate,
+        LowerCI = conf.low,
+        UpperCI = conf.high,
+        p_value = p.value
+      ) |>
+      select(test, week, n, predictor_variable, OddsRatio, LowerCI, UpperCI, p_value)
+    
+    return(final_results)
+  } else {
+    return(NULL)
+  }
+}
+```
+
+## Running the function:
+
+```{r}
+# 1. Define your parameters
+test_codes_to_run <- c("MMSE", "ADLTOTAL", "ADLPQPT", "LMIIA", "CFITOTAL", 
+                       "ADLPQSP", "CFISP", "PACC", "DIGIT", "CFIPT", "FCSRT96")
+
+# This vector MUST include 0 because this function version hardcodes Week 0 as the baseline.
+target_weeks_for_analysis <- c(0, 48, 108, 168, 204, 240)
+
+
+# 2. Call the function for each test
+# This assumes your raw data is in a frame named 'ADQS_raw' and your outcome data is in 'wide_cdr_indicator'.
+# Replace these with your actual data frame names if they are different.
+
+all_results <- purrr::map_dfr(test_codes_to_run, ~process_and_model_delta_scores(
+  adqs_data = ADQS_raw,
+  test_code = toupper(.x),
+  target_weeks = target_weeks_for_analysis,
+  window_weeks = 14,
+  outcome_data = wide_cdr_indicator,
+  outcome_var = "CDPOS_W240"
+))
+
+print(all_results)
+```
+
+## UPDATED PLOT 07/20 to go with the above
+
+```{r}
+# Define the map from variable names to display names
+test_name_map <- c(
+  "ADLPQPT" = "ADL Patient Questionnaire",
+  "ADLPQSP" = "ADL Study Partner Questionnaire",
+  "ADLTOTAL" = "ADL Total",
+  "CFIPT" = "CFI Patient",
+  "CFISP" = "CFI Study Partner",
+  "CFITOTAL" = "CFI Total",
+  "DIGIT" = "Digit Symbol Substitution",
+  "FCSRT96" = "FCSRT-IR",
+  "LMIIA" = "Logical Memory IIa",
+  "MMSE" = "MMSE",
+  "PACC" = "PACC"
+)
+
+if (!is.null(all_results) && nrow(all_results) > 0) {
+
+  # --- Data Preparation ---
+  
+  # IMPORTANT: This code assumes your 'all_results' dataframe has a column named 'n' 
+  # for the sample size. If your column is named differently, please update the 
+  # 'aes(label = ...)' part in the geom_text() layers below.
+
+  plot_data <- all_results |>
+    mutate(test = factor(test, levels = toupper(sort(test_codes_to_run))))
+
+  # 1. Split the data into two groups
+  cfi_tests <- c("CFITOTAL", "CFIPT", "CFISP")
+  cfi_data <- plot_data |> filter(test %in% cfi_tests)
+  other_data <- plot_data |> filter(!test %in% cfi_tests)
+  
+  # --- Plot 1: CFI Tests ---
+  
+  if (nrow(cfi_data) > 0) {
+    cfi_plot <- ggplot(cfi_data, aes(x = week, y = OddsRatio)) +
+      geom_hline(yintercept = 1,
+                 linetype = "dashed",
+                 color = "grey40") +
+      geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI),
+                    width = 10,
+                    color = "grey50") +
+      geom_line(aes(group = 1), color = "#005f73") +
+      geom_point(color = "#005f73", size = 2.5) +
+      # 2. Add sample size text below the points
+      geom_text_repel(
+        # Key change: Use the LowerCI value for the y-position
+        aes(y = LowerCI, label = paste0("n=", n)),
+        
+        # Nudge text slightly down from the end of the error bar
+        nudge_y = -0.08,
+        
+        # Hide the connector lines for a cleaner look
+        min.segment.length = Inf,
+        
+        # Other styling options
+        direction = "y",
+        # You can restrict direction to just vertical
+        size = 3,
+        color = "grey30"
+      )  +
+      facet_wrap(
+        ~ test,
+        scales = "fixed",
+        ncol = 3,
+        labeller = as_labeller(test_name_map)
+      ) +
+      labs(
+        title = "Odds Ratios for CFI Tests with Increasing Scores",
+        subtitle = "Based on change from baseline in cognitive scores at earlier timepoints",
+        x = "Week of Assessment",
+        y = expression("Odds Ratio (e"^beta * ")")
+      ) +
+      scale_x_continuous(breaks = target_weeks, limits = c(24, 264)) +
+      theme_bw(base_size = 12) +
+      theme(
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+    print(cfi_plot)
+  }
+
+  # --- Plot 2: Remaining Tests ---
+  
+  if (nrow(other_data) > 0) {
+    other_plot <- ggplot(other_data, aes(x = week, y = OddsRatio)) +
+      geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+      geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 10, color = "grey50") +
+      geom_line(aes(group = 1), color = "#005f73") +  
+      geom_point(color = "#005f73", size = 2.5) +
+      # 2. Add sample size text below the points
+      geom_text_repel(
+        # Key change: Use the LowerCI value for the y-position
+        aes(y = LowerCI, label = paste0("n=", n)),
+        
+        # Nudge text slightly down from the end of the error bar
+        nudge_y = -0.08,
+        
+        # Hide the connector lines for a cleaner look
+        min.segment.length = Inf,
+        
+        # Other styling options
+        direction = "y",
+        # You can restrict direction to just vertical
+        size = 3,
+        color = "grey30"
+      ) +
+      facet_wrap(~ test, scales = "fixed", ncol = 3, labeller = as_labeller(test_name_map)) +
+      labs(
+        title = "Odds Ratios for Remaining Cognitive Tests",
+        subtitle = "Based on change from baseline in cognitive scores at earlier timepoints",
+        x = "Week of Assessment",
+        y = expression("Odds Ratio (e"^beta*")")
+      ) +
+      scale_x_continuous(breaks = target_weeks, limits = c(24, 264)) +
+      theme_bw(base_size = 12) +
+      theme(
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank()
+      )
+    
+    print(other_plot)
+  }
+}
+
+ggsave(
+  # The name of the file you want to create
+  filename = "other_plot.png", 
+  
+  # The plot object to save
+  plot = other_plot, 
+  
+  # Dimensions of the saved image
+  width = 11, 
+  height = 9, 
+  units = "in", # units can be "in", "cm", "mm", or "px"
+  
+  # Resolution in dots per inch (300 is good for documents)
+  dpi = 300 
+)
+```
+
+## C3 starts here
+
+```{r}
+c3_clean <- C3_raw |>
+  select(BID, TDate_DAYS_T0, C3Comp) |>
+  na.omit() |>
+  distinct(BID, TDate_DAYS_T0, .keep_all = TRUE) |> 
+  filter(BID %in% placebo_bids) |>
+  mutate(WEEK = TDate_DAYS_T0 / 7) |>
+  select(BID, WEEK, C3_SCORE = C3Comp, TDate_DAYS_T0)
+
+# This logic also remains the same.
+c3_baseline <- c3_clean |>
+  group_by(BID) |>
+  slice_min(order_by = WEEK, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(BID, C3_BASELINE = C3_SCORE)
+
+c3_baseline <- c3_clean |>
+  # Keep only observations at or before week 0
+  filter(WEEK <= 0) |>
+  # Group by individual
+  group_by(BID) |>
+  # Find the row with the largest week number (closest to 0)
+  slice_max(order_by = WEEK, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  # Select the BID and the baseline score
+  select(BID, C3_BASELINE = C3_SCORE) 
+  
+c3_with_change <- c3_clean |>
+  inner_join(c3_baseline, by = "BID") |>
+  mutate(C3_CHANGE = C3_SCORE - C3_BASELINE) |> 
+  filter(WEEK > 0) |> 
+  select(BID,TDate_DAYS_T0,WEEK,C3_SCORE,C3_BASELINE,C3_CHANGE)
+```
+
+## C3 plot
+
+```{r}
+target_weeks <- c(48, 108, 168, 204, 240)
+window_weeks <- 14
+outcome_var <- "CDPOS_W240"
+
+# For each subject, find the single C3_CHANGE score that is closest to each target week,
+# ensuring it falls within the 12-week window.
+c3_closest_visits <- c3_with_change |>
+  # Select only the necessary columns
+  select(BID, WEEK, C3_CHANGE) |>
+  
+  # for each visit, find its single closest target week
+  mutate(
+    distance_to_target = map(WEEK, ~ abs(.x - target_weeks)),
+    target_week = map_int(distance_to_target, ~ target_weeks[which.min(.x)])
+  ) |>
+  
+  # keep only visits within the 12-week window
+  filter(abs(WEEK - target_week) <= window_weeks) |>
+  
+  # if multiple visits are in the window for a subject/target, keep the closest one
+  group_by(BID, target_week) |>
+  slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(BID, target_week, C3_CHANGE)
+
+# Pivot to wide format and join with the outcome data from wide_cdr_indicator
+model_data_c3 <- c3_closest_visits |>
+  pivot_wider(
+    names_from = target_week,
+    values_from = C3_CHANGE,
+    names_prefix = "C3_CHANGE_W"
+  ) |>
+  inner_join(
+    wide_cdr_indicator |> select(BID, all_of(outcome_var)),
+    by = "BID"
+  ) |>
+  # Ensure the outcome variable is not NA
+  filter(!is.na(.data[[outcome_var]]))
+
+# Identify all the C3 change columns to use as predictors
+predictor_vars <- model_data_c3 |>
+  select(starts_with("C3_CHANGE_W")) |>
+  names()
+
+# loop through each predictor, fit a model
+c3_results <- map(predictor_vars, function(var) {
+  # ensure the predictor has more than one unique value to be modeled
+  if (n_distinct(model_data_c3[[var]], na.rm = TRUE) < 2) return(NULL)
+  
+  formula <- as.formula(paste(outcome_var, "~", var))
+  
+  model <- glm(formula, data = model_data_c3, family = binomial())
+  
+  tidy(model, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(term != "(Intercept)") |>
+    mutate(predictor_variable = var) # Keep track of which predictor was used
+}) |>
+  # remove any NULL results from failed models and combine into one table
+  compact() |>
+  bind_rows()
+```
+
+```{r}
+# --- 4. Format Results and Generate Plot ---
+if (!is.null(c3_results) && nrow(c3_results) > 0) {
+  
+  # calculate the sample size (n) for each time point
+  # the number of subjects contributing to each model
+  sample_sizes <- c3_closest_visits |>
+    count(target_week, name = "n")
+
+  # prepare the final data for plotting
+  plot_data_c3 <- c3_results |>
+    rename(
+      OddsRatio = estimate,
+      LowerCI = conf.low,
+      UpperCI = conf.high,
+      p_value = p.value
+    ) |>
+    # extract the week number from the predictor variable name for the x-axis
+    mutate(
+      week = as.integer(str_extract(predictor_variable, "\\d+$"))
+    ) |>
+    select(week, OddsRatio, LowerCI, UpperCI, p_value, predictor_variable) |>
+    
+    # join the sample sizes to the plot data
+    left_join(sample_sizes, by = c("week" = "target_week"))
+
+
+  # Generate the forest plot
+  c3_forest_plot <- ggplot(plot_data_c3, aes(x = week, y = OddsRatio)) +
+    # Add a dashed line at y=1 (which indicates no effect)
+    geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+    
+    # Add the error bars for the 95% Confidence Interval
+    geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 10, color = "grey50") +
+    
+    # Add the sample size labels
+    geom_text_repel(
+      aes(y = LowerCI, label = paste0("n=", n)),
+      nudge_y = -0.08,
+      min.segment.length = Inf,
+      direction = "y",
+      size = 3,
+      color = "grey30"
+    ) +
+    
+    geom_line(color = "#005f73") +
+    
+    geom_point(color = "#005f73", size = 3) +
+   
+    labs(
+      title = "Odds Ratios for CDR Progression at Week 240",
+      subtitle = "Based on Change from Baseline in C3 Score at Earlier Timepoints",
+      x = "Week of Assessment",
+      y = expression("Odds Ratio (e"^beta*")")
+    ) +
+    
+    scale_x_continuous(breaks = target_weeks) +
+    
+    theme_bw(base_size = 14) +
+    theme(panel.grid.minor = element_blank())
+
+  # Display the plot
+  print(c3_forest_plot)
+  
+} else {
+  print("Modeling could not be completed. Please check your data.")
+}
+
+ggsave("c3.png", c3_forest_plot)
+```
+
+## Merging plots 07/20
+
+```{r}
+# Make sure all required data objects are available:
+# all_results, c3_results, c3_closest_visits, test_codes_to_run, target_weeks
+
+# --- 1. Define an updated map with a name for the C3 plot ---
+test_name_map <- c(
+  "C3" = "C3 Composite", # Added entry for the new plot
+  "ADLPQPT" = "ADL Patient Questionnaire",
+  "ADLPQSP" = "ADL Study Partner Questionnaire",
+  "ADLTOTAL" = "ADL Total",
+  "CFIPT" = "CFI Patient",
+  "CFISP" = "CFI Study Partner",
+  "CFITOTAL" = "CFI Total",
+  "DIGIT" = "Digit Symbol Substitution",
+  "FCSRT96" = "FCSRT-IR",
+  "LMIIA" = "Logical Memory IIa",
+  "MMSE" = "MMSE",
+  "PACC" = "PACC"
+)
+
+# --- 2. Prepare Data for the "Other" Cognitive Tests ---
+if (!is.null(all_results) && nrow(all_results) > 0) {
+  
+  plot_data <- all_results |>
+    mutate(test = factor(test, levels = toupper(sort(test_codes_to_run))))
+  
+  cfi_tests <- c("CFITOTAL", "CFIPT", "CFISP")
+  # Note: The C3 plot will be separate, so we only need 'other_data' here
+  other_data <- plot_data |> filter(!test %in% cfi_tests)
+}
+
+# --- 3. Prepare Data for the C3 Test ---
+if (!is.null(c3_results) && nrow(c3_results) > 0) {
+  
+  sample_sizes <- c3_closest_visits |>
+    count(target_week, name = "n")
+
+  plot_data_c3 <- c3_results |>
+    rename(
+      OddsRatio = estimate,
+      LowerCI = conf.low,
+      UpperCI = conf.high
+    ) |>
+    mutate(
+      week = as.integer(str_extract(predictor_variable, "\\d+$")),
+      test = "C3" # Add the 'test' identifier for faceting
+    ) |>
+    select(test, week, OddsRatio, LowerCI, UpperCI) |>
+    left_join(sample_sizes, by = c("week" = "target_week"))
+}
+
+# --- 4. Combine All Plotting Data and Generate the Grid Plot ---
+if (exists("other_data") && exists("plot_data_c3")) {
+  combined_plot_data <- bind_rows(other_data, plot_data_c3)
+  final_grid_plot <- ggplot(combined_plot_data, aes(x = week, y = OddsRatio)) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+    geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 10, color = "grey50") +
+    geom_line(aes(group = 1), color = "#005f73") +
+    geom_point(color = "#005f73", size = 2.5) +
+    geom_text_repel(
+      aes(y = LowerCI, label = paste0("n=", n)),
+      nudge_y = -0.08,
+      min.segment.length = Inf,
+      direction = "y",
+      size = 3,
+      color = "grey30"
+    ) +
+    facet_wrap(~ test, ncol = 3, labeller = as_labeller(test_name_map)) +
+    labs(
+      title = "Odds Ratios for All Cognitive Tests and C3 Composite",
+      subtitle = "Based on change from baseline scores at earlier timepoints",
+      x = "Week of Assessment",
+      y = expression("Odds Ratio (e"^beta*")")
+    ) +
+    scale_x_continuous(breaks = target_weeks) +
+    theme_bw(base_size = 12) +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+  
+  print(final_grid_plot)
+}
+```
+
+
+```{r}
+ggsave(
+  filename = "odds_ratio_grid_plot.png", 
+  plot = final_grid_plot, 
+  width = 11, 
+  height = 9, 
+  units = "in",
+  dpi = 300 
+)
+
+ggsave(
+  filename = "cfi_plots.png", 
+  plot = cfi_plot,
+  width = 11, 
+  height = 9, 
+  units = "in", # units can be "in", "cm", "mm", or "px"
+  dpi = 300 
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
