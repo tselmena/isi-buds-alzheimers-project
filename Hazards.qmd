@@ -1,0 +1,418 @@
+---
+title: "Km Curves, HR for CDR Progression"
+format: html
+author: "Christopher Turner"
+---
+
+```{r}
+library(tidyverse)
+library(broom)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(DescTools)
+library(survminer)
+library(survival)
+```
+
+```{r}
+root_path <- "/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData"
+base_path <- file.path(root_path, "Raw Data")
+derived_path <- file.path(root_path, "Derived Data")
+external_path <- file.path(root_path, "External Data")
+CDR_raw <- read_csv(file.path(base_path, "cdr.csv"))
+ADQS_raw <- read_csv(file.path(derived_path, "ADQS.csv"))
+SUBJINFO_raw <- read_csv(file.path(derived_path, "SUBJINFO.csv"))
+C3_raw <- read_csv(file.path(external_path, "cogstate_battery.csv"))
+```
+
+```{r}
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "001") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw %>%
+  filter(VISITCD == "006") %>%
+  select(BID, QSTESTCD, QSSTRESN) %>%
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw %>%
+  left_join(V6OUTCOME, by = "BID") %>%
+  left_join(V1OUTCOME %>%
+      select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") %>%
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+
+# Filter ADQS_raw for PACC collected in the blinded phases among mITT population
+ADQS_PACC <- ADQS_raw %>%
+  filter(MITTFL== 1) %>%
+  filter(EPOCH == "BLINDED TREATMENT" | AVISIT == "006") %>%
+  filter(QSTESTCD == "PACC") %>%
+  rename(PACC = QSSTRESN) %>%
+  select(BID, ASEQNCS, TX, ADURW, TX, AGEYR, 
+    AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) %>%
+  mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) %>%
+  na.omit()
+
+# placebo group SUBJINFO
+SUBJINFO_PLAC <- SUBJINFO |> 
+  filter(TX %in% "Placebo")
+
+placebo_bids <- SUBJINFO_PLAC$BID
+```
+
+
+## 12 Week Window Indicator Table
+
+```{r}
+# prep raw CDR file for use
+CDR_ind <- CDR_raw |> 
+  select(c("BID", "CDGLOBAL","CDADTC_DAYS_T0", "EPOCH", "CDDY", "CDEVENT")) |> 
+  filter(BID %in% placebo_bids) |>
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  ) |> 
+  filter(WEEK <= 252)
+
+# defining our target weeks and the window size
+target_weeks <- c(48, 108, 168, 204, 240)
+window_weeks <- 12 
+
+CDR_closest_week_windowed <- CDR_ind |>
+  # for each visit, calculate its distance to ALL target weeks
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) |>
+  unnest(distance_to_target) |>
+  
+  # identify which target week is the closest for that visit
+  group_by(BID, WEEK, CDGLOBAL) |>
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) |>
+  ungroup() |> 
+
+  filter(abs(WEEK - target_week) <= window_weeks) |>
+
+  # for each subject and target week, if there happen to be
+  # multiple visits in the window, keep the single closest one
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup() |> 
+  mutate(
+    range = target_week - WEEK
+  )
+
+wide_cdr_indicator <- CDR_closest_week_windowed |>
+  mutate(
+    CD_indicator = if_else(CDGLOBAL > 0, 1, 0)
+  ) |>
+  select(BID, target_week, CD_indicator) |> 
+  pivot_wider(
+    names_from = target_week,
+    values_from = CD_indicator, 
+    names_prefix = "CDPOS_W",   
+    values_fill = NA 
+  ) 
+
+# when is the first time of global cdr conversion?
+conversion_times <- 
+  CDR_closest_week_windowed |>
+  filter(CDGLOBAL > 0) |>
+  group_by(BID) |>
+  summarise(
+    CDRCONV_WEEK = min(WEEK)
+  )
+
+# final dataframe with indicator + min time to global cdr conversion
+wide_cdr_indicator <- left_join(wide_cdr_indicator, conversion_times, by = "BID") 
+```
+
+
+
+```{r}
+# ---- Get time-to-event + event indicator ----
+surv_data <- SUBJINFO_PLAC |>
+  select(BID) |>
+  left_join(conversion_times |> select(BID, time_to_event = CDRCONV_WEEK), by = "BID") |>
+  mutate(
+    event = if_else(is.na(time_to_event), 0L, 1L),
+    time_to_event = if_else(is.na(time_to_event), 240, time_to_event)
+  )
+target_times <- c(48, 108, 168, 204, 240)
+
+surv_data <- surv_data %>%
+  mutate(
+    closest_time_val = map_dbl(time_to_event, ~ target_times[which.min(abs(.x - target_times))])
+  )
+test_vars <- c("MMSE", "ADLTOTAL", "LMIIa", "PACC", "DIGIT", "CFITOTAL", "CFISP", "CFIPT", "ADLPQPT", "ADLPQSP")
+
+test_scores <- ADQS_raw |>
+  filter(QSTESTCD %in% test_vars) |>
+  select(BID, QSTESTCD, QSSTRESN, ADURW)
+baseline_cdglobal_summary <- CDR_raw |>
+  filter(VISCODE == "001") |>
+  group_by(CDGLOBAL) |>
+  summarise(
+    n = n()
+  ) |>
+  arrange(CDGLOBAL)
+```
+
+```{r CDR PROGRESSION}
+# Step 1: For those who progressed, get the earliest progression day per BID
+cdr_progression_weeks <- CDR_ind %>%
+  filter(EPOCH != "OPEN LABEL TREATMENT") %>%  # remove open label
+  filter(CDEVENT == 1) %>%                      # only progressed events
+  group_by(BID) %>%
+  slice_min(order_by = CDDY, n = 1, with_ties = FALSE) %>%  # earliest progression
+  ungroup() %>%
+  mutate(Progression_Week = CDDY / 7) %>%
+  select(BID, Progression_Week)
+
+# Step 2: Get the full list of unique BIDs observed (excluding open label)
+all_subjects <- CDR_ind %>%
+  filter(EPOCH != "OPEN LABEL TREATMENT") %>%
+  distinct(BID)
+
+# Step 3: Join progression weeks back onto all subjects, preserving all BIDs
+cdr_progression_complete <- all_subjects %>%
+  left_join(cdr_progression_weeks, by = "BID")
+
+```
+
+```{r}
+adqs_placebo <- ADQS_raw %>%
+  filter(TX == "Placebo") %>%
+  select(BID, QSTESTCD, QSTEST, QSCHANGE, ADURW)
+
+# Step 2: Merge with cdr_progression_complete by BID
+final_data <- cdr_progression_complete %>%
+  left_join(adqs_placebo, by = "BID")
+make_wide_test_scores <- function(adqs_data, test_code, target_weeks, window_weeks) {
+  is_cfi_adl <- test_code %in% c("CFITOTAL", "CFISP", "CFIPT", "ADLTOTAL", "ADLPQPT", "ADLPQSP")
+  
+  # Filter & clean test data, using QSCHANGE
+  test_data <- adqs_data |>
+    filter(toupper(QSTESTCD) == test_code, TX == "Placebo") |>
+    select(BID, WEEK = ADURW, SCORE = QSCHANGE) |>
+    filter(!is.na(WEEK), !is.na(SCORE))
+  
+  if (nrow(test_data) == 0) return(NULL)
+  
+  # Closest visit to each target week
+  closest <- test_data |>
+    mutate(
+      tmp = map(WEEK, ~ abs(.x - target_weeks)),
+      target_week = map_int(tmp, ~ target_weeks[which.min(.x)])
+    ) |>
+    select(-tmp) |>
+    filter(abs(WEEK - target_week) <= window_weeks) |>
+    group_by(BID, target_week) |>
+    slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+    ungroup()
+
+  # Remove all baseline timepoints (e.g., week 0 or screening)
+  followup <- closest |>
+    filter(target_week > 0)
+
+  # Pivot follow-up into wide format
+  wide_followup <- followup |>
+    mutate(varname = paste0(test_code, "_", target_week)) |>
+    select(BID, varname, SCORE) |>
+    pivot_wider(names_from = varname, values_from = SCORE)
+
+  return(wide_followup)
+}
+
+test_codes <- c("MMSE", "ADLTOTAL", "ADLPQPT", "LMIIA", "CFITOTAL", 
+                "ADLPQSP", "CFISP", "PACC", "DIGIT", "CFIPT", "FCSRT96")
+
+target_weeks <- c(0, 48, 108, 168, 204, 240)
+
+# Generate and reduce all wide test datasets
+wide_tests_combined <- purrr::map(test_codes, ~ make_wide_test_scores(
+  adqs_data = ADQS_raw,
+  test_code = .x,
+  target_weeks = target_weeks,
+  window_weeks = 14
+)) |>
+  reduce(full_join, by = "BID")
+wide_tests_combined <- wide_tests_combined %>%
+  left_join(cdr_progression_complete, by = "BID")
+# Create final survival dataset
+survival_data <-  wide_tests_combined %>%
+  mutate(
+    time_to_event = ifelse(is.na(Progression_Week), 240, pmin(Progression_Week, 240)),
+    event_indicator = ifelse(!is.na(Progression_Week) & Progression_Week <= 240, 1, 0))
+
+```
+
+
+```{r fig.height=10, fig.width=15}
+run_km_single_test <- function(data, test_var) {
+  survival_data <- data %>%
+    mutate(
+      time = time_to_event,
+      status = event_indicator
+    )
+
+  this_data <- survival_data %>%
+    select(BID, time, status, !!sym(test_var)) %>%
+    drop_na() %>%
+    mutate(
+      Quartile = ntile(.data[[test_var]], 4),
+      Quartile = factor(Quartile, levels = 1:4, labels = paste0("Q", 1:4))
+    )
+
+  fit <- survfit(Surv(time, status) ~ Quartile, data = this_data)
+
+  plot <- ggsurvplot(
+    fit,
+    data = this_data,
+    risk.table = TRUE,
+    pval = TRUE,
+    title = paste("KM Curve for", test_var),
+    xlab = "Weeks",
+    ylab = "CDR-Free Probability",
+    legend.title = "Quartile",
+    xlim = c(0, 240),
+    break.time.by = 48,
+    palette = "Dark2"
+  )
+
+  return(plot)
+}
+# Example case running PACC for each time point with Quantiles
+walk(c(48, 108, 168, 240), ~ print(run_km_single_test(survival_data, paste0("PACC_", .x))))
+```
+
+```{r}
+extract_continuous_hr_table <- function(data, test_vars, time_points) {
+  hr_results <- list()
+  
+  survival_data <- data |>
+    mutate(time = time_to_event, status = event_indicator)
+  
+  for (test in test_vars) {
+    for (tp in time_points) {
+      test_col <- paste0(test, "_", tp)
+      if (!test_col %in% names(survival_data)) next
+      
+      this_data <- survival_data |>
+        select(BID, time, status, all_of(test_col)) |>
+        drop_na()
+      
+      if (nrow(this_data) < 10) next
+      
+      formula <- as.formula(paste("Surv(time, status) ~", test_col))
+      cox_model <- coxph(formula, data = this_data)
+      model_summary <- broom::tidy(cox_model, exponentiate = TRUE, conf.int = TRUE)
+      
+      model_summary <- model_summary |>
+        mutate(Test = test,
+               Time = tp,
+               Term = test_col)
+      
+      hr_results[[paste(test, tp, sep = "_")]] <- model_summary
+    }
+  }
+  
+  bind_rows(hr_results)
+}
+time_points <- c(48, 108, 168, 204, 240)
+
+# Generate HR table for continuous predictors
+hr_table_cont <- extract_continuous_hr_table(survival_data, test_vars, time_points)
+
+# Format for plotting
+hr_table_cont <- hr_table_cont |>
+  mutate(
+    Week = paste0("Week ", Time),
+    Week = factor(Week, levels = paste0("Week ", sort(unique(Time)))),
+    Test = factor(Test, levels = test_vars)
+  )
+
+# Classify based on CI relation to 1
+hr_table_cont <- hr_table_cont |>
+  mutate(
+    is_cfi = grepl("CFI", Test),
+    effect_group = case_when(
+      is_cfi & conf.low > 1 ~ "Progression",
+      is_cfi & conf.high < 1 ~ "No Progression",
+      !is_cfi & conf.high < 1 ~ "Progression",
+      !is_cfi & conf.low > 1 ~ "No Progression",
+      TRUE ~ "No Progression"
+    )
+  )
+
+# Define color mapping
+color_map <- c("No Progression" = "#950606", "Progression" = "#0A5D00")
+
+# Create forest plot
+forest_plot_conditional <- ggplot(hr_table_cont, aes(x = Week, y = estimate)) +
+  geom_point(aes(color = effect_group), size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high, color = effect_group), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = color_map, name = "") +
+  scale_y_log10(limits = c(0.7, 1.5)) +
+  facet_wrap(~ Test, scales = "free_y", ncol = 2) +
+  labs(title = "Hazard Ratios for CDR Progression",
+       x = "Week",
+       y = "Hazard Ratio (log scale)") +
+  theme_bw(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 16, face = "bold", color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, face="bold"),
+    legend.position = "bottom", 
+    strip.background = element_rect(fill = "white", color = NA)
+  )
+
+# Save plot
+ggsave("conditional_forest_plot.png", forest_plot_conditional, width = 12, height = 30, dpi = 300)
+
+
+```
