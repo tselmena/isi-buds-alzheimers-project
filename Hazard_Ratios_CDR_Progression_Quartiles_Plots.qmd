@@ -3,7 +3,9 @@ title: "Hazard Ratios for CDR Progression"
 format: html
 editor: visual
 ---
+
 ## Setup and Libraries
+
 ```{r setup}
 #| message: false
 #| warning: false
@@ -100,7 +102,6 @@ SUBJINFO <- SUBJINFO_raw %>%
 SUBJINFO_PLAC <- SUBJINFO %>% 
   filter(TX %in% "Placebo")
 ```
-
 
 ```{r}
 create_individual_test_plots <- function(data, tests) {
@@ -202,3 +203,15 @@ if (nrow(hr_line_data) > 0 && length(unique(hr_line_data$Test)) > 0) {
   ggsave("hazard_ratios_by_test_time.png", hazard_line_plot, width = 15, height = 12, dpi = 300)
 }
 ```
+
+1.  **Higher-performing quartiles (Q1) consistently show lower risk of CDR progression** across nearly all cognitive and functional tests, with hazard ratios increasing stepwise from Q1 to Q4 — most prominently in global cognition composites like **PACC**, **MMSE**, and **CFITOTAL**.
+
+2.  **Temporal divergence becomes more pronounced over time**, with the hazard ratios for lower quartiles (Q4 vs Q1) generally increasing or remaining elevated through 208–240 weeks, suggesting persistent and compounding risk differences across cognitive performance strata.
+
+3.  **Tests of episodic memory and executive function** — such as **FCSRT96**, **LMIILA**, and **DIGIT** — show strong risk separation, particularly for Q3 and Q4, indicating their utility as sensitive predictors of long-term cognitive decline.
+
+4.  **Uncertainty is higher in mid-study timepoints and lower-powered domains**, as reflected in wider confidence intervals (e.g., **ADLPQSP**, **CFISP**), but the overall directional trend (lower performance → higher risk) remains consistent across domains.
+
+------------------------------------------------------------------------
+
+Let me know if you'd like domain-specific interpretations (e.g., for memory vs executive vs function) or summary statements per quartile group.
