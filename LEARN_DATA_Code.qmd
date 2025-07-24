@@ -1,0 +1,485 @@
+---
+title: "LEARN"
+format: html
+editor: visual
+---
+
+# SETUP
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(table1)
+library(dplyr)
+library(tidyr) 
+library(purrr) 
+library(ggplot2)
+library(patchwork)
+library(broom)
+library(stringr)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(DescTools)
+library(leaps)
+library(glmnet)
+library(pROC)
+```
+
+```{r data-read}
+#| include: false
+
+setwd('C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/Derived Data')
+
+SUBJINFO_raw <- read_csv("SUBJINFO.csv")
+
+ADQS_raw <- read_csv("ADQS.csv")
+
+CDR_raw <- read_csv("C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/Raw Data/cdr.csv")
+
+C3_raw <- read_csv("C:/Users/emili/OneDrive - University of Georgia/ISI-BUDS/project-week1/A4SecondaryAnalysis/A4SecondaryAnalysis/A4_ClinicalData/External Data/cogstate_battery.csv")
+```
+
+
+```{r}
+# Outcomes collected at Visit 1
+V1OUTCOME <- ADQS_raw  |> 
+  filter(VISITCD == "001") |>
+  select(SUBSTUDY, BID, QSTESTCD, QSSTRESN) |>
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+# Outcomes collected at Visit 6
+V6OUTCOME <- ADQS_raw |>
+  filter(VISITCD == "006") |>
+  select(SUBSTUDY, BID, QSTESTCD, QSSTRESN) |>
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO_LEARN <- SUBJINFO_raw |>
+  left_join(V6OUTCOME, by = "BID") |>
+  left_join(V1OUTCOME |> 
+      select(SUBSTUDY, BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP), 
+    by = "BID") |>
+  filter(SUBSTUDY == "LEARN") |> 
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(
+      SEX == 1 ~ "Female",
+      SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White",
+      RACE == 2 ~ "Black or African American",
+      RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander",
+      RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported",
+      RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced",
+      MARITAL == 4 ~ "Never married",
+      MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married",
+      MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino",
+      ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No",
+      ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No",
+      CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No",
+      TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes",
+      WRKRET == 0 ~ "No",
+      WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes",
+      APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR),
+    SUVRCER = as.numeric(SUVRCER),
+    AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU),
+    COGDSSTTSV6 = as.numeric(COGDSSTTSV6),
+    COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(
+      SUBJCOMPTR == 1 ~ "Completer",
+      TRUE ~ "Dropout"))
+learn_bids <- SUBJINFO_LEARN |>
+  select(BID) |> 
+  unlist() |> 
+  unname()
+```
+
+# CDR INDICATOR
+
+```{r}
+# prep raw CDR file for use
+CDR_ind <- CDR_raw |> 
+  select(c("SUBSTUDY", "BID", "CDGLOBAL","CDADTC_DAYS_T0")) |> 
+  filter(BID %in% learn_bids) |>
+  filter(CDADTC_DAYS_T0 >= 0) |> 
+  mutate(
+    WEEK = CDADTC_DAYS_T0 / 7
+  ) |> 
+  filter(WEEK <= 252)
+
+# defining our target weeks and the window size
+target_weeks <- c(48, 108, 168, 204, 240)
+window_weeks <- 12 
+
+CDR_closest_week_windowed <- CDR_ind |>
+  # for each visit, calculate its distance to ALL target weeks
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks))) |>
+  unnest(distance_to_target) |>
+  
+  # identify which target week is the closest for that visit
+  group_by(BID, WEEK, CDGLOBAL) |>
+  mutate(target_week = target_weeks[which.min(distance_to_target)]) |>
+  ungroup() |> 
+
+  filter(abs(WEEK - target_week) <= window_weeks) |>
+
+  # for each subject and target week, if there happen to be
+  # multiple visits in the window, keep the single closest one
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup() |> 
+  mutate(
+    range = target_week - WEEK
+  )
+
+wide_cdr_indicator <- CDR_closest_week_windowed |>
+  mutate(
+    CD_indicator = if_else(CDGLOBAL > 0, 1, 0)
+  ) |>
+  select(BID, target_week, CD_indicator) |> 
+  pivot_wider(
+    names_from = target_week,
+    values_from = CD_indicator, 
+    names_prefix = "CDPOS_W",   
+    values_fill = NA 
+  ) 
+
+# when is the first time of global cdr conversion?
+conversion_times <- 
+  CDR_closest_week_windowed |>
+  filter(CDGLOBAL > 0) |>
+  group_by(BID) |>
+  summarise(
+    CDRCONV_WEEK = min(WEEK)
+  )
+
+# final dataframe with indicator + min time to global cdr conversion
+wide_cdr_indicator <- left_join(wide_cdr_indicator, conversion_times, by = "BID") 
+```
+
+## GET DATAFRAMES FUNCTION
+
+``` {r}
+get_data_frames <- function(data, test_code, target_weeks_w_0 , window_weeks, baseline_window_weeks, outcome_data, outcome_var) {
+  test_data <- data |>
+    filter(toupper(QSTESTCD) == test_code) |>
+    select(BID, WEEK = ADURW, SCORE = QSSTRESN) |>
+    filter(!is.na(WEEK), !is.na(SCORE))
+
+  if (nrow(test_data) == 0) {
+    # Return NULL if no data for this test code
+    return(NULL)
+  }
+
+  closest <- test_data |>
+    # Create a temporary list-column with the absolute difference to each target week
+    mutate(
+      tmp = map(WEEK, ~ abs(.x - target_weeks_w_0 )),
+      # Find the target week with the minimum difference
+      target_week = map_int(tmp, ~ target_weeks_w_0 [which.min(.x)])
+    ) |>
+    select(-tmp) |>
+    # Filter to keep only visits within the specified window of the assigned target week
+    filter(abs(WEEK - target_week) <= if_else(target_week <= 0, baseline_window_weeks, window_weeks)) |>
+    group_by(BID, target_week) |>
+    # For each subject and target week, keep the visit with the smallest time difference
+    slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+    ungroup()
+
+  baseline_scores <- closest |>
+    filter(target_week <= 0) |>
+    group_by(BID) |>
+    # If multiple baseline candidates, take the one with the latest date
+    slice_max(order_by = target_week, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(BID, baseline_score = SCORE)
+
+  wide_followup_scores <- closest |>
+    filter(target_week > 0) |>
+    select(BID, target_week, SCORE) |>
+    pivot_wider(
+      id_cols = BID,
+      names_from = target_week,
+      values_from = SCORE,
+      names_prefix = paste0(test_code, "_W")
+    )
+
+  # Check if there are any followup scores to process
+  if (ncol(wide_followup_scores) <= 1) {
+    return(NULL)
+  }
+
+  wide_scores_with_deltas <- wide_followup_scores |>
+    inner_join(baseline_scores, by = "BID") |>
+    mutate(across(
+      .cols = starts_with(paste0(test_code, "_W")),
+      .fns = ~ .x - baseline_score,
+      .names = "delta_{.col}"
+    ))
+
+  # --- Prepare Final Data for Modeling ---
+  model_data <- wide_scores_with_deltas |>
+    inner_join(
+      outcome_data |> select(BID, all_of(outcome_var)),
+      by = "BID"
+    ) |>
+    filter(!is.na(.data[[outcome_var]]))
+
+  # standardize deltas for comparison (z-scores)
+  model_data <- model_data |>
+    mutate(across(
+      .cols = starts_with("delta_"),
+      .fns = ~ as.numeric(scale(.x)),
+      .names = "z_{.col}"
+    ))
+
+  return(model_data)
+}
+``` 
+
+```{r}
+# code in our parameters
+test_codes <- c("ADLPQPT", "ADLPQSP", "ADLTOTAL", 
+                "CFIPT", "CFISP", "CFITOTAL", 
+                "DIGIT", "FCSRT96", "LMIIA", "MMSE", "PACC")
+outcome_var <- "CDPOS_W240"
+target_weeks_w_0 <- c(0, 48, 108, 168, 204, 240)
+baseline_window_weeks <- 14
+window_weeks <- 12
+
+``` 
+
+``` {r}
+all_tests_list <- map(test_codes, ~get_data_frames(
+  data = ADQS_raw,
+  test_code = .x,
+  target_weeks = target_weeks_w_0,
+  window_weeks = window_weeks,
+  baseline_window_weeks = baseline_window_weeks,
+  outcome_data = wide_cdr_indicator,
+  outcome_var = "CDPOS_W240"
+))
+all_tests_list
+``` 
+`weekly_dataframes` (variable) is a list containing 5 dataframes. These only contain the z-score changes from baseline. Each dataframe contains all predictors. 
+
+- Each of the dataframes in the list corresponds to one of target weeks 
+- Columns: 
+  - BID, 
+  - CDPOS_W240 (response)
+  - Z-score delta values
+
+``` {r}
+### Combine all dataframes into one.
+# First, select only the BID and the standardized delta columns from each dataframe
+# This prevents column name collisions with other columns like 'baseline_score'
+z_delta_dfs <- map(all_tests_list, ~select(.x, BID, starts_with("z_delta_")))
+
+# Use reduce to iteratively join all dataframes in the list by the subject ID.
+# A full_join is used to ensure all subjects are kept, even if they are missing a specific test.
+combined_z_deltas <- reduce(z_delta_dfs, full_join, by = "BID")
+
+# Join the outcome variable back to the combined data.
+# We can get the outcome from the first processed dataframe.
+outcome_df <- all_tests_list[[7]] |> select(BID, all_of("CDPOS_W240"))
+final_combined_df <- inner_join(combined_z_deltas, outcome_df, by = "BID")
+
+# Split the combined dataframe into a list of dataframes, one for each follow-up week.
+followup_weeks <- target_weeks_w_0[target_weeks_w_0  > 0]
+
+weekly_dataframes <- map(followup_weeks, function(week) {
+  # Define the suffix pattern for the columns for the current week (e.g., "_W48")
+  week_pattern <- paste0("_W", week)
+
+  # Select the BID, the outcome variable, and all the z_delta columns for that specific week.
+  final_combined_df |>
+    select(BID, all_of("CDPOS_W240"), ends_with(week_pattern))
+})
+
+## Name the list elements for easy access (e.g., weekly_dataframes$W48)
+names(weekly_dataframes) <- paste0("W", followup_weeks)
+
+weekly_dataframes
+```
+
+## C3 Data
+```{r}
+C3_raw %>%
+  filter(SUBSTUDY == "LEARN") |> 
+  summarise(min_day = min(TDate_DAYS_T0, na.rm = TRUE),
+            max_day = max(TDate_DAYS_T0, na.rm = TRUE))
+
+```
+
+
+```{r}
+c3_clean <- C3_raw |>
+  select(SUBSTUDY, BID, TDate_DAYS_T0, C3Comp) |>
+  na.omit() |>
+  distinct(BID, TDate_DAYS_T0, .keep_all = TRUE) |> 
+  filter(BID %in% learn_bids) |>
+  mutate(WEEK = TDate_DAYS_T0 / 7) |>
+  select(SUBSTUDY, BID, WEEK, C3_SCORE = C3Comp, TDate_DAYS_T0)
+
+c3_baseline <- c3_clean |>
+  # Keep only observations at or before week 0
+  filter(WEEK <= 0) |>
+  # Group by individual
+  group_by(BID) |>
+  # Find the row with the largest week number (closest to 0)
+  slice_max(order_by = WEEK, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  # Select the BID and the baseline score
+  select(BID, baseline_score = C3_SCORE)
+  
+c3_with_change <- inner_join(c3_clean, c3_baseline, by = "BID") |>
+  mutate(C3_CHANGE = C3_SCORE - baseline_score) |> 
+  filter(WEEK > 0) |> 
+  select(BID,TDate_DAYS_T0,WEEK,C3_SCORE,baseline_score, C3_CHANGE)
+
+## Interpolation of C3 Data
+target_weeks_c3 <- c(48, 108, 168, 204, 240) 
+
+interpolated_c3 <- c3_with_change |>
+  # two measurements to draw a line between them
+  group_by(BID) |>
+  filter(n() >= 2) |>
+  # data is sorted by week 
+  arrange(WEEK, .by_group = TRUE) |>
+  # use nest() to create a list-column of dataframes (one per BID)
+  nest() |>
+  # create a new column containing the interpolated values for each BID
+  mutate(interp_data = map(data, ~ {
+    # approxfun creates a linear interpolation function for the given points.
+    # `rule = 2` tells it to return NA for any target week outside the range
+    # of the person's measurements (i.e., it will not extrapolate).
+    interp_func <- approxfun(x = .x$WEEK, y = .x$C3_CHANGE, rule = 2)
+
+    # return a clean tibble of target weeks and their new interpolated values
+    tibble(
+      target_week = target_weeks_c3,
+      C3_CHANGE = interp_func(target_weeks)
+    )
+  })) |>
+  select(BID, interp_data) |>
+  # unnest the list-column back into a regular long-format dataframe
+  unnest(interp_data) |>
+  filter(!is.na(C3_CHANGE))
+
+# Pivot to the wide format for modeling
+# This assumes 'wide_cdr_indicator' and 'outcome_var' are defined elsewhere
+model_data_c3 <- interpolated_c3 |>
+  pivot_wider(
+    names_from = target_week,
+    values_from = C3_CHANGE,
+    names_prefix = "z_delta_C3_W"
+  ) |>
+  inner_join(
+    wide_cdr_indicator |> select(BID, all_of(outcome_var)),
+    by = "BID"
+  ) |>
+  left_join(c3_baseline, by = "BID") |>
+  # Filter out subjects with no outcome or baseline
+  filter(!is.na(.data[[outcome_var]]), !is.na(baseline_score)) |>
+  # Standardize the delta columns to create z-scores, just like in your function
+  mutate(across(
+    .cols = starts_with("delta_C3_W"),
+    .fns = ~ as.numeric(scale(.x)),
+    .names = "z_{.col}"
+  ))
+```
+
+
+```{r}
+C3_48 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W48)
+
+C3_108 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W108)
+
+C3_168 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W168)
+
+C3_204 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W204)
+
+C3_240 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W240)
+```
+
+```{r}
+C3_48 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W48)
+
+C3_108 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W108)
+
+C3_168 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W168)
+
+C3_204 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W204)
+
+C3_240 <- 
+  model_data_c3 |> 
+  select(BID, z_delta_C3_W240)
+```
+
+```{r}
+# save all dataframes
+W48_df <- full_join(weekly_dataframes$W48, C3_48, by = join_by(BID)) |> na.omit() |> select(-BID)
+W108_df <- full_join(weekly_dataframes$W108, C3_108, by = join_by(BID)) |> na.omit() |> select(-BID)
+W168_df <- full_join(weekly_dataframes$W168, C3_168, by = join_by(BID)) |> na.omit() |> select(-BID)
+W204_df <- full_join(weekly_dataframes$W204, C3_204, by = join_by(BID)) |> na.omit() |> select(-BID)
+W240_df <- full_join(weekly_dataframes$W240, C3_240, by = join_by(BID)) |> na.omit() |> select(-BID)
+```
+
+```{r}
+# number of individuals per week
+nrow(W48_df)
+nrow(W108_df)
+nrow(W168_df)
+nrow(W204_df)
+nrow(W240_df)
+```
+
+## Week 48 Dataset 
+
+```{r}
+LEARN_raw_delta_48 <- map(all_tests_list, ~select(.x, BID, ends_with("_W48")))
+LEARN_comb_raw_delta_48 <- reduce(LEARN_raw_delta_48, full_join, by = "BID")
+LEARN_outcome_df2 <- all_tests_list[[7]] |> select(BID, all_of("CDPOS_W240"))
+LEARN_final_combined_df_raw <- inner_join(LEARN_comb_raw_delta_48, LEARN_outcome_df2, by = "BID")
+LEARN_W48_df_raw <- full_join(LEARN_final_combined_df_raw, C3_48, by = join_by(BID)) |> 
+  na.omit() |> 
+  select(BID, CDPOS_W240, ends_with("_W48"))
+
+write.csv(LEARN_W48_df_raw, "LEARN_W48_Raw_And_Delta_Data1.csv")
+```
+
+
+
