@@ -1,0 +1,931 @@
+---
+title: "CDR Progression Hazard Ratios (Z-scores, Baseline Adjusted)"
+format: html
+author: "Christopher Turner"
+---
+
+```{r packages}
+# Load necessary R packages
+library(tidyverse)
+library(broom)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(DescTools)
+library(survminer)
+library(survival)
+library(dynpred)
+library(Hmisc)
+library(scoring)
+```
+
+```{r global}
+# --- Define Global Parameters ---
+# Adjust this path to your actual data directory
+root_path <- "/Users/christopherturner/Documents/ISI-BUDS/Research_Gillen/A4SecondaryAnalysis/A4_ClinicalData"
+
+# Define target weeks for analysis
+target_weeks <- c(48, 108, 168, 204, 240) # These are for follow-up
+target_weeks_w_0 <- c(0, 48, 108, 168, 204, 240) # Used by get_data_frames for baseline + follow-up
+window_weeks <- 12 # Window size for finding closest visits
+baseline_window_weeks <- 14 # Window for baseline visits
+
+# Define test variables to analyze (excluding C3, which is handled separately)
+test_vars <- c("ADLPQPT", "ADLPQSP","ADLTOTAL", "CFIPT", "CFISP", "CFITOTAL","PACC","LMIIA","DIGIT", "MMSE", "FCSRT96")
+```
+
+```{r load}
+base_path <- file.path(root_path, "Raw Data")
+derived_path <- file.path(root_path, "Derived Data")
+external_path <- file.path(root_path, "External Data")
+
+CDR_raw <- read_csv(file.path(base_path, "cdr.csv"))
+ADQS_raw <- read_csv(file.path(derived_path, "ADQS.csv"))
+SUBJINFO_raw <- read_csv(file.path(derived_path, "SUBJINFO.csv"))
+C3_raw <- read_csv(file.path(external_path, "cogstate_battery.csv"))
+```
+
+```{r prepare_data}
+V1OUTCOME <- ADQS_raw |>
+  filter(VISITCD == "001") |>
+  select(BID, QSTESTCD, QSSTRESN) |>
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+V6OUTCOME <- ADQS_raw |>
+  filter(VISITCD == "006") |>
+  select(BID, QSTESTCD, QSSTRESN) |>
+  pivot_wider(values_from = QSSTRESN, names_from = QSTESTCD)
+
+SUBJINFO <- SUBJINFO_raw |>
+  left_join(V6OUTCOME, by = "BID") |>
+  left_join(V1OUTCOME |>
+    select(BID, CDRSB, CFITOTAL, CFISP, CFIPT, ADLPQPT, ADLPQSP),
+    by = "BID") |>
+  mutate(
+    AGECAT = case_when(AGEYR < 65 ~ "Age < 65",
+      AGEYR >= 65 & AGEYR < 75 ~ "65 <= Age < 75",
+      AGEYR >= 75 & AGEYR < 85 ~ "75 <= Age < 85",
+      AGEYR >= 85 ~ "Age >= 85"),
+    SEX = factor(case_when(SEX == 1 ~ "Female", SEX == 2 ~ "Male"), levels = c("Male", "Female")),
+    RACE = case_when(RACE == 1 ~ "White", RACE == 2 ~ "Black or African American", RACE == 58 ~ "Asian",
+      RACE == 79 ~ "Native Hawaiian or Other Pacific Islander", RACE == 84 ~ "American Indian or Alaskan Native",
+      RACE == 97 ~ "Unknown or Not Reported", RACE == 100 ~ "More than one race"),
+    MARITAL = case_when(MARITAL == 2 ~ "Divorced", MARITAL == 4 ~ "Never married", MARITAL == 5 ~ "Widowed",
+      MARITAL == 11 ~ "Married", MARITAL == 97 ~ "Unknown or Not Reported"),
+    ETHNIC = case_when(ETHNIC == 50 ~ "Hispanic or Latino", ETHNIC == 56 ~ "Not Hispanic or Latino",
+      ETHNIC == 97 ~ "Unknown or Not reported"),
+    ALCHLBL = case_when(ALCHLBL == 0 ~ "No", ALCHLBL == 1 ~ "Yes"),
+    CFBL = case_when(CFBL == 0 ~ "No", CFBL == 1 ~ "Yes"),
+    TBBL = case_when(TBBL == 0 ~ "No", TBBL == 1 ~ "Yes"),
+    WRKRET = case_when(WRKRET == 1 ~ "Yes", WRKRET == 0 ~ "No", WRKRET == 96 ~ "Not Applicable"),
+    APOEGNPRSNFLG = case_when(APOEGNPRSNFLG == 1 ~ "Yes", APOEGNPRSNFLG == 0 ~ "No"),
+    AGEYR = as.numeric(AGEYR), SUVRCER = as.numeric(SUVRCER), AMYLCENT = as.numeric(AMYLCENT),
+    EDCCNTU = as.numeric(EDCCNTU), COGDSSTTSV6 = as.numeric(COGDSSTTSV6), COGLMDRTSV6 = as.numeric(COGLMDRTSV6),
+    TX = factor(TX, levels = c("Placebo", "Solanezumab")),
+    COMPLETER_label = case_when(SUBJCOMPTR == 1 ~ "Completer", TRUE ~ "Dropout"))
+
+ADQS_PACC <- ADQS_raw |>
+  filter(MITTFL== 1, EPOCH == "BLINDED TREATMENT" | AVISIT == "006", QSTESTCD == "PACC") |>
+  rename(PACC = QSSTRESN) |>
+  select(BID, ASEQNCS, TX, ADURW, TX, AGEYR, AAPOEGNPRSNFLG, EDCCNTU, SUVRCER, QSVERSION, PACC) |>
+  mutate(TX = factor(TX, levels = c("Placebo", "Solanezumab"))) |>
+  na.omit()
+
+SUBJINFO_PLAC <- SUBJINFO |>
+  filter(TX %in% "Placebo")
+placebo_bids <- SUBJINFO_PLAC$BID
+
+adqs_placebo <- ADQS_raw |>
+  filter(TX == "Placebo") |>
+  select(BID, QSTESTCD, QSTEST, QSCHANGE, QSBLRES, ADURW)
+```
+
+```{r prepare_cdr_progression_data}
+#OBJECTIVE: CONVERT to QSCHANGE, so you can compare delta values, then standardize, then baseline. 
+# --- Prepare CDR Progression Data ---
+# Prep raw CDR file for use, filter by placebo subjects and week range
+CDR_ind <- CDR_raw |>
+  # Calculate WEEK first using mutate()
+  mutate(WEEK = CDADTC_DAYS_T0 / 7) |>
+  # Then filter based on WEEK and placebo_bids
+  filter(BID %in% placebo_bids, WEEK <= 252) |>
+  select(c("BID", "CDGLOBAL", "CDADTC_DAYS_T0", "EPOCH", "CDDY", "CDEVENT", "WEEK"))
+
+# Identify closest CDR visit within window to target weeks
+CDR_closest_week_windowed <- CDR_ind |>
+  mutate(distance_to_target = map(WEEK, ~abs(.x - target_weeks)),
+         target_week = map_int(distance_to_target, ~ target_weeks[which.min(.x)])) |>
+  select(-distance_to_target) |> # Remove intermediate column
+  filter(abs(WEEK - target_week) <= window_weeks) |>
+  group_by(BID, target_week) |>
+  slice_min(n = 1, order_by = abs(WEEK - target_week), with_ties = FALSE) |>
+  ungroup() |>
+  mutate(range = target_week - WEEK)
+
+# Create wide indicator for CDR conversion at target weeks
+wide_cdr_indicator <- CDR_closest_week_windowed |>
+  mutate(CD_indicator = if_else(CDGLOBAL > 0, 1, 0)) |>
+  select(BID, target_week, CD_indicator) |>
+  pivot_wider(names_from = target_week, values_from = CD_indicator, names_prefix = "CDPOS_W", values_fill = NA )
+
+# Determine the first time of global CDR conversion for event
+conversion_times <- CDR_closest_week_windowed |>
+  filter(CDGLOBAL > 0) |>
+  group_by(BID) |>
+  summarise(CDRCONV_WEEK = min(WEEK))
+
+# Combine all CDR progression info
+cdr_progression_complete <- CDR_ind |>
+  filter(EPOCH != "OPEN LABEL TREATMENT") |>
+  filter(CDEVENT == 1) |>
+  group_by(BID) %>%
+  slice_min(order_by = CDDY, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(Progression_Week = CDDY / 7) |>
+  select(BID, Progression_Week) |>
+  full_join(CDR_ind |> filter(EPOCH != "OPEN LABEL TREATMENT") |> distinct(BID), by = "BID")
+```
+
+
+```{r c3_clean}
+c3_clean <- C3_raw |>
+  select(BID, TDate_DAYS_T0, C3Comp) |>
+  na.omit() |>
+  distinct(BID, TDate_DAYS_T0, .keep_all = TRUE) |>
+  filter(BID %in% placebo_bids) |>
+  mutate(WEEK = TDate_DAYS_T0 / 7) |>
+  select(BID, WEEK, C3_SCORE = C3Comp, TDate_DAYS_T0)
+
+c3_baseline <- c3_clean |>
+  filter(WEEK <= 0) |>
+  group_by(BID) |>
+  slice_max(order_by = WEEK, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(BID, baseline_score_C3 = C3_SCORE) # Rename to avoid conflict later
+
+c3_with_change <- c3_clean |>
+  inner_join(c3_baseline, by = "BID") |>
+  mutate(C3_CHANGE = C3_SCORE - baseline_score_C3) |>
+  filter(WEEK > 0) |>
+  select(BID, TDate_DAYS_T0, WEEK, C3_SCORE, baseline_score_C3, C3_CHANGE)
+
+target_weeks_c3 <- c(48, 108, 168, 204, 240) # Same as target_weeks
+
+interpolated_c3_z_deltas <- c3_with_change |>
+  group_by(BID) |>
+  filter(n() >= 2 & sum(!is.na(C3_CHANGE)) >= 2) |>
+  arrange(WEEK, .by_group = TRUE) |>
+  nest() |>
+  mutate(interp_data = map(data, ~ {
+    if (sum(!is.na(.x$C3_CHANGE)) < 2) {
+      return(tibble(target_week = target_weeks_c3, C3_CHANGE = NA_real_))
+    }
+    interp_func <- approxfun(x = .x$WEEK, y = .x$C3_CHANGE, rule = 2)
+    tibble(
+      target_week = target_weeks_c3,
+      C3_CHANGE = interp_func(target_weeks_c3)
+    )
+  })) |>
+  select(BID, interp_data) |>
+  unnest(interp_data) |>
+  filter(!is.na(C3_CHANGE)) |>
+  # Now standardize the C3_CHANGE values to get z-scores
+  group_by(target_week) |> # Group by target_week to standardize within each week
+  mutate(z_delta_C3_W = as.numeric(scale(C3_CHANGE))) |>
+  ungroup() |>
+  select(BID, target_week, z_delta_C3_W) |>
+  # Pivot to wide format for joining
+  pivot_wider(
+    names_from = target_week,
+    values_from = z_delta_C3_W,
+    names_prefix = "z_delta_C3_W"
+  )
+
+# Join C3 baseline score
+c3_final_data <- interpolated_c3_z_deltas |>
+  left_join(c3_baseline, by = "BID")
+```
+
+```{r delta}
+get_data_frames <- function(data, test_code, target_weeks, window_weeks, baseline_window_weeks) {
+  # Define tests that were previously problematic (ADL/CFI) for QSCHANGE vs. QSSTRESN-QSBLRES differences
+  problematic_tests <- c("ADLPQPT", "ADLPQSP", "ADLTOTAL", "CFIPT", "CFISP", "CFITOTAL")
+  use_qschange_path <- toupper(test_code) %in% problematic_tests
+
+  # Extract relevant raw data for the specific test_code
+  test_raw_data <- data |>
+    filter(toupper(QSTESTCD) == test_code, TX == "Placebo") |>
+    select(BID, WEEK = ADURW, QSSTRESN, QSCHANGE, QSBLRES)
+
+  # --- Handle Baseline Scores (for the _BL variable) ---
+  subject_baselines <- test_raw_data |>
+    filter(WEEK <= baseline_window_weeks) |>  # Look within baseline window
+    filter(!is.na(QSBLRES)) |>                # Keep only defined baseline values
+    group_by(BID) |>
+    slice_min(order_by = abs(WEEK), n = 1, with_ties = FALSE) |>  # Closest to week 0
+    ungroup() |>
+    select(BID, baseline_score = QSBLRES)
+
+  # --- Handle Delta / Z-score Delta Calculation ---
+  if (use_qschange_path) {
+    # --- Path 1: Use QSCHANGE for problematic tests ---
+    message(paste0("DEBUG: [", test_code, "] Using QSCHANGE path for delta calculation."))
+
+    test_deltas <- test_raw_data |>
+      filter(!is.na(QSCHANGE), WEEK > 0) |>
+      mutate(
+        tmp = map(WEEK, ~ abs(.x - target_weeks)),
+        target_week = map_int(tmp, ~ target_weeks[which.min(.x)])
+      ) |>
+      select(-tmp) |>
+      filter(abs(WEEK - target_week) <= window_weeks) |>
+      group_by(BID, target_week) |>
+      slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+      ungroup() |>
+      select(BID, target_week, raw_delta = QSCHANGE)
+
+  } else {
+    # --- Path 2: Use QSSTRESN - QSBLRES for other tests ---
+    message(paste0("DEBUG: [", test_code, "] Using QSSTRESN - QSBLRES path for delta calculation."))
+
+    test_deltas <- test_raw_data |>
+      filter(!is.na(QSSTRESN), WEEK > 0) |>
+      mutate(
+        tmp = map(WEEK, ~ abs(.x - target_weeks)),
+        target_week = map_int(tmp, ~ target_weeks[which.min(.x)])
+      ) |>
+      select(-tmp) |>
+      filter(abs(WEEK - target_week) <= window_weeks) |>
+      group_by(BID, target_week) |>
+      slice_min(order_by = abs(WEEK - target_week), n = 1, with_ties = FALSE) |>
+      ungroup() |>
+      select(BID, target_week, QSSTRESN_value = QSSTRESN) |>
+      inner_join(subject_baselines, by = "BID") |>
+      mutate(raw_delta = QSSTRESN_value - baseline_score) |>
+      select(BID, target_week, raw_delta)
+  }
+
+  # --- Common Steps: Z-score transformation and Pivoting ---
+  if (nrow(test_deltas) == 0) {
+    message(paste0("DEBUG: [", test_code, "] No delta data found for any path. Returning NULL."))
+    return(NULL)
+  }
+
+  z_scored_deltas <- test_deltas |>
+    group_by(target_week) |>
+    mutate(z_score = as.numeric(scale(raw_delta))) |>
+    ungroup() |>
+    select(BID, target_week, z_score)
+
+  # Pivot z-scores to wide format
+  wide_z_scores <- z_scored_deltas |>
+    pivot_wider(
+      id_cols = BID,
+      names_from = target_week,
+      values_from = z_score,
+      names_prefix = paste0("z_delta_", test_code, "_W")
+    )
+
+  final_data_for_test <- wide_z_scores |>
+    left_join(subject_baselines, by = "BID")
+
+  message(paste0("DEBUG: [", test_code, "] Final subjects returned: ", n_distinct(final_data_for_test$BID)))
+  return(final_data_for_test)
+}
+```
+
+
+
+```{r z_score_transform}
+# Apply get_data_frames to all tests (excluding C3)
+# Note: removed outcome_data and outcome_var args from get_data_frames call
+# In z_score_transform:
+all_tests_processed_list <- purrr::map(test_vars, ~ get_data_frames(
+  data = ADQS_raw,
+  test_code = toupper(.x),
+  target_weeks = target_weeks, # <--- Change to 'target_weeks' (which is the global variable)
+  window_weeks = window_weeks,
+  baseline_window_weeks = baseline_window_weeks
+)) |> compact() 
+
+# Combine ADQS z_deltas
+z_delta_dfs_list <- map(all_tests_processed_list, ~ select(.x, BID, starts_with("z_delta_")))
+combined_z_deltas_adqs <- reduce(z_delta_dfs_list, full_join, by = "BID")
+
+# Combine ADQS baselines using the more robust method
+adqs_baselines_list <- purrr::map(all_tests_processed_list, ~ {
+  z_delta_cols <- names(.x)[str_detect(names(.x), "^z_delta_")]
+  if (length(z_delta_cols) > 0) {
+    test_prefix <- gsub("^z_delta_([A-Z0-9]+)_W\\d+$", "\\1", z_delta_cols[1])
+    .x |>
+      select(BID, baseline_score) |>
+      distinct(BID, .keep_all = TRUE) |>
+      rename(!!paste0(test_prefix, "_BL") := baseline_score)
+  } else {
+    NULL
+  }
+})
+adqs_baselines_wide <- adqs_baselines_list |>
+  compact() |>
+  reduce(full_join, by = "BID")
+
+# Join ADQS z_deltas and baselines, then add C3 data, then CDR progression info
+survival_data_z <- combined_z_deltas_adqs |>
+  full_join(adqs_baselines_wide, by = "BID") |>
+  # Add C3 data
+  full_join(c3_final_data, by = "BID") |>
+  # Rename C3 baseline to fit naming convention:
+  rename(C3_BL = baseline_score_C3) |>
+  # Join with CDR progression info (this is the key join for outcomes)
+  left_join(cdr_progression_complete, by = "BID") |>
+  mutate(
+    time_to_event = ifelse(is.na(Progression_Week), 240, pmin(Progression_Week, 240)),
+    event_indicator = ifelse(!is.na(Progression_Week) & Progression_Week <= 240, 1, 0)
+  ) |>
+  # Filter to only include subjects with valid outcome for survival analysis
+  filter(!is.na(time_to_event), !is.na(event_indicator))
+
+# Debug summaries
+print("Summary of survival_data_z after integration")
+print(summary(survival_data_z))
+print(paste("Final sample size:", nrow(survival_data_z)))
+```
+
+```{r hazard_ratio}
+# Function to extract continuous HRs from Cox models (adjusted for baseline)
+extract_continuous_hr_table_adjusted <- function(data, test_vars_list, time_points_list) {
+  hr_results <- list()
+  survival_data_local <- data |> mutate(time = time_to_event, status = event_indicator)
+
+  for (test in test_vars_list) {
+    for (tp in time_points_list) {
+      test_col <- paste0("z_delta_", test, "_W", tp)
+      baseline_col <- paste0(test, "_BL")
+
+      if (!test_col %in% names(survival_data_local)) {
+        warning(paste("DEBUG: Missing Z-score delta col (", test_col, "). Skipping."))
+        next
+      }
+
+      if (baseline_col %in% names(survival_data_local)) {
+        formula_str <- paste("Surv(time, status) ~", test_col, "+", baseline_col)
+        selected_cols <- c("BID", "time", "status", test_col, baseline_col)
+      } else {
+        formula_str <- paste("Surv(time, status) ~", test_col)
+        selected_cols <- c("BID", "time", "status", test_col)
+      }
+
+      this_data <- survival_data_local |>
+        select(all_of(selected_cols)) |>
+        drop_na()
+
+      if (nrow(this_data) < 10) {
+        warning(paste("DEBUG: Not enough data points (n=", nrow(this_data), ") for Cox model for", test_col, "with baseline/unadjusted. Skipping."))
+        next
+      }
+
+      formula <- as.formula(formula_str)
+      cox_model <- coxph(formula, data = this_data)
+      model_summary <- broom::tidy(cox_model, exponentiate = TRUE, conf.int = TRUE)
+
+      filtered_summary <- model_summary |>
+        filter(term == test_col) |>
+        mutate(Test = test, Time = tp, Term = test_col, n = nrow(this_data))
+
+      if (nrow(filtered_summary) == 1) {
+        hr_results[[paste(test, tp, sep = "_")]] <- filtered_summary
+      } else {
+        warning(paste("DEBUG: Could not extract summary for Z-score delta term from Cox model for", test_col, ". Skipping."))
+      }
+    }
+  }
+
+  if (length(hr_results) == 0)
+    warning("No adjusted CoxPH models were successfully run.")
+  
+  return(bind_rows(hr_results))
+}
+
+# Function to extract continuous HRs from Cox models (no baseline adjustment)
+extract_continuous_hr_table_unadjusted <- function(data, test_vars_list, time_points_list) {
+  hr_results <- list()
+  survival_data_local <- data |> mutate(time = time_to_event, status = event_indicator)
+
+  for (test in test_vars_list) {
+    for (tp in time_points_list) {
+      test_col <- paste0("z_delta_", test, "_W", tp)
+
+      if (!test_col %in% names(survival_data_local)) {
+        next
+      }
+
+      this_data <- survival_data_local |>
+        select(BID, time, status, all_of(test_col)) |>
+        drop_na()
+
+      if (nrow(this_data) < 10) {
+        warning(paste("Not enough data points (n=", nrow(this_data), ") for Cox model for", test_col, "unadjusted. Skipping."))
+        next
+      }
+
+      formula <- as.formula(paste("Surv(time, status) ~", test_col))
+      cox_model <- coxph(formula, data = this_data)
+      model_summary <- broom::tidy(cox_model, exponentiate = TRUE, conf.int = TRUE)
+
+      filtered_summary <- model_summary |>
+        filter(term == test_col) |>
+        mutate(Test = test, Time = tp, Term = test_col, n = nrow(this_data))
+
+      if (nrow(filtered_summary) == 1) {
+        hr_results[[paste(test, tp, sep = "_")]] <- filtered_summary
+      } else {
+        warning(paste("Could not extract summary for unadjusted Z-score delta term from Cox model for", test_col, ". Skipping."))
+      }
+    }
+  }
+
+  if (length(hr_results) == 0)
+    warning("No unadjusted CoxPH models were successfully run.")
+  
+  return(bind_rows(hr_results))
+}
+```
+
+
+```{r extract_hazard_ratio}
+available_z_score_tests_for_hr <- unique(gsub("^z_delta_([A-Z0-9]+)_W\\d+$", "\\1", names(survival_data_z)[grepl("^z_delta_.*_W\\d+$", names(survival_data_z))] ))
+
+# Calculate HRs adjusted for baseline scores
+hr_table_adjusted <- extract_continuous_hr_table_adjusted(data = survival_data_z, 
+                                                          test_vars_list = available_z_score_tests_for_hr, time_points_list = target_weeks)
+
+# Calculate HRs without baseline adjustment
+hr_table_unadjusted <- extract_continuous_hr_table_unadjusted(data = survival_data_z,
+                                                              test_vars_list = available_z_score_tests_for_hr, time_points_list = target_weeks)
+
+summary(hr_table_adjusted)
+```
+
+```{r HR Results and Color mapping}
+format_hr_table <- function(hr_data, available_tests) {hr_data |>
+    mutate(Week = factor(paste0("Week ", Time), levels = paste0("Week ", sort(unique(hr_data$Time)))),
+           Test = factor(Test, levels = available_tests),
+           effect_group = case_when(
+             grepl("^CFI", Test) & conf.low > 1 ~ "Association with Increased CDR Progression",
+             grepl("^CFI", Test) & conf.high < 1 ~ "Association with Decreased CDR Progression",
+             !grepl("^CFI", Test) & conf.high < 1 ~ "Association with Increased CDR Progression",
+             !grepl("^CFI", Test) & conf.low > 1 ~ "Association with Decreased CDR Progression",
+             TRUE ~ "No Significant Association"))}
+
+hr_table_adjusted <- format_hr_table(hr_table_adjusted, available_z_score_tests_for_hr)
+hr_table_unadjusted <- format_hr_table(hr_table_unadjusted, available_z_score_tests_for_hr)
+hr_table_adjusted
+color_map_hrs <- c("Association with Increased CDR Progression" = '#23395B',
+                   "Association with Decreased CDR Progression" = "#0A3200",
+                   "No Significant Association" = '#D62839')
+```
+
+```{r forest_plot_facet, fig.height=15, fig.width=15}
+forest_plot_adjusted <- ggplot(hr_table_adjusted, aes(x = Week, y = estimate)) +
+  geom_point(aes(color = effect_group), size = 2) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high, color = effect_group), width = 0.2) +
+  geom_text(
+    aes(label = paste0("n=", n)),
+    position = position_nudge(y = 0.12),
+    size = 4,
+    fontface = "italic"
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = '#D62839') +
+  scale_color_manual(values = color_map_hrs, name = "Association with CDR Progression") +
+  scale_y_log10(
+    limits = c(0.2, 3.6),
+    expand = expansion(mult = c(0.05, 0.15)),
+    breaks = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0, 2.8, 3.6)
+  ) +
+  facet_wrap(~ Test, scales = "free_y", ncol = 3) +
+  labs(
+    title = "Hazard Ratios for All Test Changes (Adjusted for Baseline, Computed Z-scores)",
+    x = "Week",
+    y = "Hazard Ratio (log scale)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 16, face = "bold", color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "white", color = NA),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+ggsave("forest_plot_all_tests_baseline_adjusted_z_scores.png", forest_plot_adjusted, width = 10, height = 15, dpi = 300)
+
+print(forest_plot_adjusted)
+glimpse(survival_data_z)
+```
+
+```{r long_forest, fig.height=10, fig.width=15}
+# --- Plot: Long Forest Plot for Week 48 (Baseline Adjusted) ---
+
+hr_table_adjusted_week48 <- hr_table_adjusted |>
+  filter(Time == 48) |>
+  mutate(Test = fct_reorder(Test, estimate, .desc = FALSE)) 
+
+if (nrow(hr_table_adjusted_week48) == 0) {
+  warning("No data available for Week 48 tests after HR extraction. Skipping long plot.")
+} else {
+  long_forest_plot_adjusted <- ggplot(hr_table_adjusted_week48, aes(x = estimate, y = Test)) +
+    geom_point(aes(color = effect_group), size = 3) +
+    geom_errorbar(aes(xmin = conf.low, xmax = conf.high, color = effect_group), height = 0.2) +
+    geom_text(
+      aes(label = paste0("n=", n)),
+      position = position_nudge(x = 0.15),
+      size = 6,
+      fontface = "italic"
+    ) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = color_map_hrs, name = "Association with CDR Progression") +
+    scale_x_log10(
+      limits = c(0.4, 2.8),
+      expand = expansion(mult = c(0.05, 0.15)),
+      breaks = c(0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0, 2.4, 2.8)
+    ) +
+    labs(
+      title = "Hazard Ratios for CDR Progression at 240 Weeks, Adjusted for Baseline and Computed from Week 48 Z-Scores", 
+      x = "Hazard Ratio (log scale)",
+      y = ""
+    ) +
+    theme_bw(base_size = 20) +
+    theme(
+      axis.text.y = element_text(face = "bold"),
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+
+  ggsave("long_forest_plot_week48_baseline_adjusted_z_scores.png", long_forest_plot_adjusted, width = 20, height = 10, dpi = 300)
+  print(long_forest_plot_adjusted)
+}
+
+# Take the inverse (1/CFI) - Example Cox model
+coxph(Surv(time_to_event, event_indicator) ~ z_delta_MMSE_W48 + MMSE_BL, data = survival_data_z)
+```
+
+```{r stepwise_aic_selection, fig.height=10, fig.width=12}
+if (!exists("interaction_time_point")) {
+  interaction_time_point <- 48
+}
+
+# The `survival_data_z` object should be defined in your environment before this script runs.
+# If it's not, the script will fall back to generating dummy data for demonstration.
+if (!exists("survival_data_z")) {
+  set.seed(123)
+  survival_data_z <- data.frame(
+    BID = 1:100,
+    time_to_event = runif(100, 1, 100),
+    event_indicator = sample(0:1, 100, replace = TRUE),
+    z_delta_CFISP_W48 = rnorm(100),
+    z_delta_PACC_W48 = rnorm(100),
+    z_delta_ADLPQSP_W48 = rnorm(100), # Added for ADL terms
+    CFISP_BL = rnorm(100, 50, 10),
+    PACC_BL = rnorm(100, 20, 5),
+    ADLPQSP_BL = rnorm(100, 10, 2) # Added for ADL terms
+  )
+}
+
+model_data_for_stepwise <- survival_data_z %>%
+  select(
+    BID,
+    time = time_to_event,
+    status = event_indicator,
+    matches(paste0("^z_delta_.*_W", interaction_time_point, "$")),
+    matches("_BL$")
+  ) %>%
+  drop_na()
+
+all_z_delta_main_effects <- names(model_data_for_stepwise) %>%
+  keep(~ grepl(paste0("^z_delta_.*_W", interaction_time_point, "$"), .x))
+
+all_baseline_main_effects <- names(model_data_for_stepwise) %>%
+  keep(~ grepl("_BL$", .x))
+
+if (nrow(model_data_for_stepwise) < 20) {
+  stop(sprintf(
+    "Not enough complete cases (n=%d) for stepwise AIC analysis at Week %d with all main effects and interactions.",
+    nrow(model_data_for_stepwise), interaction_time_point
+  ))
+}
+
+main_effects_formula_str <- paste(c(all_z_delta_main_effects, all_baseline_main_effects), collapse = " + ")
+
+all_interaction_terms <- combn(all_z_delta_main_effects, 2, FUN = function(x) paste(x, collapse = ":"), simplify = TRUE)
+
+full_formula_str <- paste("Surv(time, status) ~", paste(c(main_effects_formula_str, all_interaction_terms), collapse = " + "))
+full_cox_formula <- as.formula(full_formula_str)
+
+message(sprintf("Fitting full Cox model for stepwise AIC at Week %d with %d main effects and %d pairwise interactions.",
+                interaction_time_point,
+                length(all_z_delta_main_effects) + length(all_baseline_main_effects),
+                length(all_interaction_terms)))
+
+# Load necessary packages (only once at the beginning if not loaded globally)
+library(survival)
+library(broom)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(tibble) # For tibble()
+
+
+# Dummy full_cox_formula if not fully built by the above logic (for standalone testing)
+if (!exists("full_cox_formula") || !inherits(full_cox_formula, "formula")) {
+  full_cox_formula <- Surv(time, status) ~ z_delta_CFISP_W48 + z_delta_PACC_W48 +
+                      CFISP_BL + PACC_BL + z_delta_CFISP_W48:CFISP_BL +
+                      z_delta_ADLPQSP_W48 + ADLPQSP_BL
+}
+
+
+full_model_for_stepAIC <- coxph(full_cox_formula, data = model_data_for_stepwise)
+small_interaction_model <- coxph(formula = Surv(time, status) ~
+    z_delta_CFISP_W48 + z_delta_PACC_W48 + z_delta_ADLPQSP_W48 + ADLPQSP_BL +
+    CFISP_BL + PACC_BL,
+    data = model_data_for_stepwise)
+
+
+# Generate the main coefficient table
+tidy_model <- broom::tidy(small_interaction_model, exponentiate = TRUE, conf.int = TRUE)
+
+term_renames <- c(
+  "z_delta_CFISP_W48" = "CFI Study Partner Change (W48)",
+  "z_delta_ADLPQSP_W48" = "ADL Study Partner Change (W48)",
+  "ADLPQSP_BL" = "ADL Study Partner Baseline",
+  "z_delta_PACC_W48" = "PACC Change (W48)",
+  "CFISP_BL" = "CFI Study Partner Baseline",
+  "PACC_BL" = "PACC Baseline"
+)
+
+formatted_tidy_model <- tidy_model %>%
+  mutate(term = recode(term, !!!term_renames)) %>%
+  # Apply p-value formatting with more precision for scientific notation first
+  mutate(
+    p.value = if_else(
+      p.value < 0.001,
+      format(p.value, scientific = TRUE, digits = 3),  # Ensure 3 digits after decimal in scientific notation
+      as.character(round(p.value, 3))
+    )
+  ) %>%
+  # Now round other numeric columns
+  mutate(across(c(`estimate`, `std.error`, `statistic`, `conf.low`, `conf.high`), ~ round(., 3))) %>%
+  rename(
+    Term = term,
+    `Hazard Ratio` = estimate,
+    `Std. Error` = std.error,
+    `Wald Z` = statistic,
+    `P-value` = p.value,
+    `Lower CI (95%)` = conf.low,
+    `Upper CI (95%)` = conf.high
+  )
+
+formatted_tidy_model %>%
+  kbl(caption = "Cox PH Model (Parsimonious)",
+      booktabs = TRUE,
+      col.names = c("Term", "Hazard Ratio", "Std. Error", "Wald Z", "P-value", "Lower CI (95%)", "Upper CI (95%)")) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+
+# Generate and print the concordance table
+c_index_full <- concordance(full_model_for_stepAIC)$concordance
+c_index_small <- concordance(small_interaction_model)$concordance
+
+model_metrics <- tibble(
+  Model = c("Full Model", "Parsimonious Model"),
+  `C-index (Concordance)` = c(round(c_index_full, 3), round(c_index_small, 3))
+)
+
+model_metrics %>%
+  kbl(caption = "Model Discrimination (C-index)", booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+```{r fig.width=15, fig.height=15}
+# library(mice)
+# library(survival)
+# library(dplyr)
+# library(ggplot2)
+# 
+# # Prepare imputation data
+# imputation_vars <- survival_data_z %>%
+#   select(
+#     time_to_event,
+#     event_indicator,
+#     matches("^z_delta_.*_W\\d+$"),
+#     matches("_BL$")
+#   )
+# imputation_data <- as.data.frame(imputation_vars)
+# 
+# set.seed(123)
+# imputed_datasets <- mice(imputation_data, m = 5, method = "pmm", maxit = 20)
+# 
+# # Extract HRs from multiply imputed datasets (adjusted for baseline)
+# extract_continuous_hr_table_adjusted_MI <- function(imputed_datasets_obj, test_vars_list, time_points_list) {
+#   hr_results <- list()
+#   m <- imputed_datasets_obj$m
+# 
+#   for (test in test_vars_list) {
+#     for (tp in time_points_list) {
+#       test_col <- paste0("z_delta_", test, "_W", tp)
+#       baseline_col <- paste0(test, "_BL")
+# 
+#       formula_str <- if (baseline_col %in% names(complete(imputed_datasets_obj, 1))) {
+#         paste("Surv(time_to_event, event_indicator) ~", test_col, "+", baseline_col)
+#       } else {
+#         paste("Surv(time_to_event, event_indicator) ~", test_col)
+#       }
+#       formula <- as.formula(formula_str)
+# 
+#       single_imputation_models <- vector("list", m)
+#       for (i in seq_len(m)) {
+#         current_imputed_data <- complete(imputed_datasets_obj, i)
+#         if (test_col %in% names(current_imputed_data) && nrow(current_imputed_data) > 10) {
+#           single_imputation_models[[i]] <- tryCatch(
+#             coxph(formula, data = current_imputed_data),
+#             error = function(e) NULL
+#           )
+#         }
+#       }
+#       single_imputation_models <- single_imputation_models[!sapply(single_imputation_models, is.null)]
+# 
+#       if (length(single_imputation_models) > 0) {
+#         pooled_fit <- pool(single_imputation_models)
+#         pooled_summary <- summary(pooled_fit, exponentiate = TRUE, conf.int = TRUE)
+#         filtered_summary <- pooled_summary %>%
+#           as_tibble() %>%
+#           filter(term == test_col) %>%
+#           mutate(Test = test, Time = tp, Term = test_col, n_imputations = length(single_imputation_models))
+# 
+#         if (nrow(filtered_summary) == 1) {
+#           hr_results[[paste(test, tp, sep = "_")]] <- filtered_summary
+#         }
+#       }
+#     }
+#   }
+#   bind_rows(hr_results)
+# }
+# 
+# # Identify tests and weeks
+# available_z_score_tests_for_hr <- unique(gsub("^z_delta_([A-Z0-9]+)_W\\d+$", "\\1", 
+#                                              names(imputation_data)[grepl("^z_delta_.*_W\\d+$", names(imputation_data))]))
+# target_weeks <- sort(unique(as.integer(gsub("^.*_W(\\d+)$", "\\1", names(imputation_data)[grepl("^z_delta_.*_W\\d+$", names(imputation_data))]))))
+# 
+# # Run extraction
+# hr_table_adjusted_MI <- extract_continuous_hr_table_adjusted_MI(
+#   imputed_datasets_obj = imputed_datasets,
+#   test_vars_list = available_z_score_tests_for_hr,
+#   time_points_list = target_weeks
+# )
+# 
+# # Prepare long-format imputed data for sample size calculation
+# imputed_data_long <- complete(imputed_datasets, "long") 
+# 
+# # Compute actual sample sizes (unique participants per Test & Time)
+# sample_sizes <- imputed_data_long %>%
+#   mutate(
+#     Test = gsub("^z_delta_([A-Z0-9]+)_W\\d+$", "\\1", .[[2]]) # Extract Test name from variable names if needed
+#   ) %>%
+#   # Actually, let's compute sample size per test & time based on non-NA test value:
+#   pivot_longer(cols = starts_with("z_delta_"), names_to = "Term", values_to = "Value") %>%
+#   mutate(
+#     Test = gsub("^z_delta_([A-Z0-9]+)_W\\d+$", "\\1", Term),
+#     Time = as.integer(gsub("^z_delta_[A-Z0-9]+_W(\\d+)$", "\\1", Term))
+#   ) %>%
+#   filter(!is.na(Value)) %>%
+#   group_by(Test, Time) %>%
+#   summarise(n = n_distinct(.id), .groups = "drop") # .id is the row id in 'long' format (unique per subject)
+# 
+# # Format HR table and merge sample sizes + add effect groups
+# format_hr_table <- function(hr_data, available_tests, sample_sizes) {
+#   hr_data %>%
+#     left_join(sample_sizes, by = c("Test", "Time")) %>%
+#     mutate(
+#       Week = factor(paste0("Week ", Time), levels = paste0("Week ", sort(unique(Time)))),
+#       Test = factor(Test, levels = available_tests),
+#       effect_group = case_when(
+#         grepl("^CFI", Test) & conf.low > 1 ~ "Association with Increased CDR Progression",
+#         grepl("^CFI", Test) & conf.high < 1 ~ "Association with Decreased CDR Progression",
+#         !grepl("^CFI", Test) & conf.high < 1 ~ "Association with Increased CDR Progression",
+#         !grepl("^CFI", Test) & conf.low > 1 ~ "Association with Decreased CDR Progression",
+#         TRUE ~ "No Significant Association"
+#       )
+#     )
+# }
+# 
+# hr_table_adjusted_MI_formatted <- format_hr_table(hr_table_adjusted_MI, available_z_score_tests_for_hr, sample_sizes)
+# 
+# # Define color map for plot
+# color_map_hrs <- c(
+#   "Association with Increased CDR Progression" = '#23395B',
+#   "Association with Decreased CDR Progression" = "#0A3200",
+#   "No Significant Association" = '#D62839'
+# )
+# 
+# # Plot forest plot
+# forest_plot_adjusted_MI <- ggplot(hr_table_adjusted_MI_formatted, aes(x = Week, y = estimate)) +
+#   geom_point(aes(color = effect_group), size = 2) +
+#   geom_errorbar(aes(ymin = conf.low, ymax = conf.high, color = effect_group), width = 0.2) +
+#   geom_text(aes(label = paste0("n=", n)),
+#             position = position_nudge(y = 0.12),
+#             size = 3.5,
+#             fontface = "italic") +
+#   geom_hline(yintercept = 1, linetype = "dashed", color = '#D62839') +
+#   scale_color_manual(values = color_map_hrs, name = "Association with CDR Progression") +
+#   scale_y_log10(
+#     limits = c(0.2, 3.6),
+#     expand = expansion(mult = c(0.05, 0.15)),
+#     breaks = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0, 2.8, 3.6)
+#   ) +
+#   facet_wrap(~ Test, scales = "free_y", ncol = 3) +
+#   labs(
+#     title = "Hazard Ratios for All Test Changes (Adjusted for Baseline, MI-Pooled Z-scores)",
+#     x = "Week",
+#     y = "Hazard Ratio (log scale)"
+#   ) +
+#   theme_bw(base_size = 14) +
+#   theme(
+#     strip.text = element_text(size = 16, face = "bold", color = "black"),
+#     axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+#     legend.position = "bottom",
+#     strip.background = element_rect(fill = "white", color = NA),
+#     plot.title = element_text(hjust = 0.5, face = "bold")
+#   )
+# 
+# ggsave("forest_plot_all_tests_baseline_adjusted_z_scores_MI.png", forest_plot_adjusted_MI, width = 10, height = 15, dpi = 300)
+# print(forest_plot_adjusted_MI)
+# plot(imputed_datasets)
+```
+
+$$\lambda(t) = \lim_{\Delta t \to 0} \frac{P(t \leq T < t + \Delta t \mid T \geq t)}{\Delta t}$$
+$$ \lambda(t \mid X) = \lambda_0(t) e^{\beta_1 X_1 + \beta_2 X_2 + \cdots + \beta_p X_p}$$
+
+$$
+\begin{align*}
+\lambda(t \mid \Delta Z_{\text{Test}, \text{Week}}^{(i)}, Z_{\text{Test, Baseline}}^{(i)})
+&= \lambda_0(t) \exp\left(
+  \beta_{1, \text{Test}, \text{Week}} \cdot \Delta Z_{\text{Test}, \text{Week}}^{(i)}
+  + \beta_{2, \text{Test}} \cdot Z_{\text{Test, Baseline}}^{(i)}
+\right)
+\end{align*}
+$$
+
+\noindent
+\textbf{Where:}
+\begin{itemize}
+    \item $\lambda(t \mid \dots)$: The hazard rate of CDR progression at time $t$ for an individual $i$, given their Z-score change and baseline score for a specific cognitive/functional test.
+    \item $\lambda_0(t)$: The baseline hazard function, representing the hazard when all covariates are zero.
+    \item $\exp(\cdot)$: The exponential function.
+    \item $\Delta Z_{\text{Test}, \text{Week}}^{(i)}$: The Z-score change for individual $i$ for a specific cognitive/functional test (`Test`) measured at follow-up Week `Week`.
+    \item $Z_{\text{Test, Baseline}}^{(i)}$: The baseline score for individual $i$ for that same `Test`.
+    \item $\beta_{1, \text{Test}, \text{Week}}$: The regression coefficient (log-Hazard Ratio) associated with a one-unit increase in $\Delta Z_{\text{Test}, \text{Week}}$.
+    \item $\beta_{2, \text{Test}}$: The regression coefficient (log-Hazard Ratio) associated with a one-unit increase in $Z_{\text{Test, Baseline}}$.
+\end{itemize}
+
+\noindent
+\textbf{Outcome Definition:}
+For each participant $i$, the outcome is defined by a pair $(T_i, \delta_i)$, where:
+\begin{itemize}
+    \item $T_i$: The time to CDR progression (CDR Global Score $>0$) or the last observed study visit (Week 240), whichever came first. This corresponds to the `time_to_event` variable in the analysis.
+    \item $\delta_i$: An event indicator, where $\delta_i = 1$ if CDR progression occurred by time $T_i$, and $\delta_i = 0$ if the participant was censored (i.e., progression had not occurred by time $T_i$). This corresponds to the `event_indicator` variable in the analysis.
+\end{itemize}
+
+\noindent
+\textbf{Modeling Notes:}
+\begin{itemize}
+    \item The models were fitted using multiple imputation (MICE) to handle missing covariate data, and results were pooled across imputed datasets.
+    \item A separate Cox model was estimated for each unique combination of `Test` and `Week`.
+\end{itemize}
+
+
+$$\begin{align*}
+h(t \mid \mathbf{X}) &= h_0(t) \exp(\boldsymbol{\beta}^\top \mathbf{X}) \\
+\text{where } \delta_i &= \mathbb{I}[\text{CDR}_{240}^{(i)} > 0] \\
+\text{and } \text{Surv}(T_i, \delta_i) &\sim \text{CoxPH model}
+\end{align*}
+$$
+
+\noindent
+\textbf{Where:}
+\begin{itemize}
+    \item $h(t \mid \Delta Z_{\text{Test}, W}^{(i)}, Z_{\text{Test, BL}}^{(i)})$: The hazard rate of CDR progression at time $t$ for an individual $i$, given their Z-score change ($\Delta Z_{\text{Test}, W}^{(i)}$) and baseline score ($Z_{\text{Test, BL}}^{(i)}$) for a specific cognitive/functional test.
+    \item $h_0(t)$: The baseline hazard function, representing the hazard when all covariates are zero.
+    \item $\exp(\cdot)$: The exponential function, ensuring the hazard is positive.
+    \item $\Delta Z_{\text{Test}, W}^{(i)}$: The Z-score change for individual $i$ for a specific cognitive/functional test (`Test`) measured at follow-up Week $W$. This is the primary predictor of interest, representing the change from baseline.
+    \item $Z_{\text{Test, BL}}^{(i)}$: The baseline score for individual $i$ for that same `Test`. This covariate is included to adjust for individual differences in baseline performance.
+    \item $\beta_{1, \text{Test}, W}$: The regression coefficient (log-Hazard Ratio) associated with a one-unit increase in $\Delta Z_{\text{Test}, W}$. This coefficient is specific to each test and week combination.
+    \item $\beta_{2, \text{Test}}$: The regression coefficient (log-Hazard Ratio) associated with a one-unit increase in $Z_{\text{Test, BL}}$. This coefficient is specific to each test.
+\end{itemize}
+
+\noindent
+\textbf{Contextual Notes:}
+\begin{itemize}
+    \item The outcome for the model is time-to-CDR progression, defined as the first occurrence of CDR Global Score $>0$.
+    \item Subjects who did not progress by 240 weeks were right-censored at 240 weeks.
+    \item The models were fitted using multiple imputation (MICE) to handle missing covariate data, and results were pooled across imputed datasets.
+\end{itemize}
